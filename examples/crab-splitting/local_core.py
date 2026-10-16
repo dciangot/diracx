@@ -2,8 +2,9 @@
 r"""A local stand-in for the Transformation System core, to exercise the CRAB plugins.
 
 DiracX does not implement DX-ADR-002..007 yet. This harness plays the core's
-part for one transformation so that the plugins in ``crab_plugins.py`` and the
-workgraph documents next to it can be run end to end on a laptop:
+part for the transformations of a workgraph, so that the plugins in
+``crab_plugins.py`` and the workgraph documents next to it can be run end to
+end on a laptop:
 
 1. **Submission** (DX-ADR-007): read the workgraph CWL document, check the
    ``dirac:`` hints, resolve the ``dirac:Feeder`` of the driving input and
@@ -18,9 +19,16 @@ workgraph documents next to it can be run end to end on a laptop:
    and run the step's process with a stock ``cwltool``; read the job's
    status report (DX-ADR-007) and apply it, calling ``HandleFailedInput``
    for failures (DX-ADR-005).
-5. **Finalizing** (DX-ADR-006): once the transformation has drained, run the
-   ``Finalizing`` actions this harness knows about; the others are reported
-   as skipped.
+5. **Completing** (DX-ADR-003/007): register the outputs of a successful
+   parcel through the catalogue (``crab_outputs.RucioOutputCatalogue`` with
+   ``--rucio``, an LFN policy otherwise) and record them in ``ParcelOutputs``,
+   which the core's edge feeder feeds to the steps that consume them.
+6. **Finalizing** (DX-ADR-006): once the transformation has drained, run the
+   ``Finalizing`` actions this harness knows about, calling a ``Pending`` one
+   again on later cycles; the others are reported as skipped.
+
+Every transformation of the workgraph is swept in each cycle, in document
+order, so that a consumer sees in the same cycle what its producer registered.
 
 Time is simulated: each cycle advances a clock by ``--cycle-minutes``, and
 cycles continue while inputs are delayed (``DelayInput``), so that a packer
@@ -35,6 +43,8 @@ Usage::
         --replicas example_replicas.json --outdir out [--scouting] [--run]
     python3 local_core.py crab-analysis-rucio.cwl --dbs example_dbs.json \\
         --rucio example_rucio.json --outdir out [--run]
+    python3 local_core.py crab-analysis-merge.cwl --dbs example_dbs.json \\
+        --rucio example_rucio.json --outdir out --run
 """
 
 from __future__ import annotations
@@ -48,7 +58,9 @@ import subprocess
 import sys
 import typing
 import uuid
+import zlib
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import entry_points
@@ -70,6 +82,15 @@ from adr006 import (
     ToProblematic,
     ToUnassigned,
 )
+from crab_outputs import ACTIONS as OUTPUT_ACTIONS
+from crab_outputs import PACKERS as OUTPUT_PACKERS
+from crab_outputs import (
+    OutputCatalogue,
+    ProducedFile,
+    RucioOutputCatalogue,
+    RucioOutputClient,
+    RucioRuleHint,
+)
 from crab_plugins import (
     FEEDERS,
     HOOKS,
@@ -79,7 +100,7 @@ from crab_plugins import (
 )
 from crab_rucio import ACTIONS, Clock, InputLock, LockTable, RucioClient
 from crab_rucio import PACKERS as RUCIO_PACKERS
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 ENTRY_POINT_GROUPS = {
     "feeder": "diracx.transformations.feeders",
@@ -92,12 +113,6 @@ ARGS_PARAMETER = {
     "packer": "packer_args",
     "hook": "args",
     "action": "args",
-}
-REGISTRIES: dict[str, dict[str, Any]] = {
-    "feeder": FEEDERS,
-    "packer": {**PACKERS, **RUCIO_PACKERS},
-    "hook": HOOKS,
-    "action": ACTIONS,
 }
 DIRAC = "dirac:"
 
@@ -166,11 +181,13 @@ class MockRucio:
     """Enough of ``rucio.client.Client`` to watch rules progress in simulated time.
 
     The JSON file holds ``{"rses": {rse: {...}}, "replicas": {lfn: {...}}}``.
-    A rule at an RSE that already has the file is ``OK`` at once. Otherwise
-    it is ``REPLICATING`` for the destination's ``transfer_minutes``, plus the
-    source's ``recall_minutes`` when every source is a tape, and then ``OK``
-    (the replica appears at the destination), or ``STUCK`` if the destination
-    is marked ``stuck``.
+    A rule covers a file, or every file of a dataset or container (including
+    files attached after the rule was made). A file already at the rule's RSE
+    is satisfied at once; otherwise it arrives after the destination's
+    ``transfer_minutes``, plus the source's ``recall_minutes`` when every
+    source is a tape, and the replica then appears at the destination. The
+    rule is ``REPLICATING`` while a file is on its way, then ``OK``, or
+    ``STUCK`` if the destination is marked ``stuck``.
     """
 
     def __init__(self, path: Path, clock: SimClock) -> None:
@@ -179,17 +196,49 @@ class MockRucio:
         self.replicas: dict[str, dict[str, Any]] = data["replicas"]
         self.clock = clock
         self.rules: dict[str, dict[str, Any]] = {}
+        # dataset and container name -> attached DID names
+        self.collections: dict[str, dict[str, Any]] = {}
+
+    def _files(self, name: str) -> list[str]:
+        if name not in self.collections:
+            return [name]
+        return [
+            f
+            for child in self.collections[name]["children"]
+            for f in self._files(child)
+        ]
+
+    def _delay(self, name: str, rse: str) -> float:
+        sources = self.replicas[name]["rses"]
+        if rse in sources:
+            return 0.0
+        delay = float(self.rses[rse].get("transfer_minutes", 0))
+        if sources and all(self.rses.get(s, {}).get("tape") for s in sources):
+            delay += max(self.rses.get(s, {}).get("recall_minutes", 0) for s in sources)
+        return delay
 
     def _refresh(self, rule: dict[str, Any]) -> dict[str, Any]:
         now = self.clock.now()
-        if rule["state"] == "REPLICATING" and now >= rule["ready_at"]:
-            if self.rses[rule["rse_expression"]].get("stuck"):
-                rule["state"] = "STUCK"
-            else:
-                rule["state"] = "OK"
-                rses = self.replicas[rule["name"]]["rses"]
-                if rule["rse_expression"] not in rses:
-                    rses.append(rule["rse_expression"])
+        rse = rule["rse_expression"]
+        stuck = bool(self.rses[rse].get("stuck"))
+        arrivals = rule["arrivals"]
+        for name in self._files(rule["name"]):
+            if name not in arrivals:
+                delay = self._delay(name, rse)
+                arrivals[name] = (now + timedelta(minutes=delay), delay > 0)
+        pending = [n for n, (t, _) in arrivals.items() if t > now]
+        moved = [n for n, (t, needed) in arrivals.items() if t <= now and needed]
+        if pending:
+            rule["state"] = "REPLICATING"
+        elif stuck and moved:
+            rule["state"] = "STUCK"
+        else:
+            rule["state"] = "OK"
+        if not stuck:
+            for name in moved:
+                if rse not in self.replicas[name]["rses"]:
+                    self.replicas[name]["rses"].append(rse)
+        rule["ready_at"] = max((t for t, _ in arrivals.values()), default=now)
         return rule
 
     def list_replicas(self, dids: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -225,14 +274,8 @@ class MockRucio:
         now = self.clock.now()
         ids = []
         for did in dids:
-            sources = self.replicas[did["name"]]["rses"]
-            delay = 0.0
-            if rse_expression not in sources:
-                delay = self.rses[rse_expression].get("transfer_minutes", 0)
-                if all(self.rses.get(s, {}).get("tape") for s in sources):
-                    delay += max(
-                        self.rses.get(s, {}).get("recall_minutes", 0) for s in sources
-                    )
+            if did["name"] not in self.collections and did["name"] not in self.replicas:
+                raise KeyError(f"DataIdentifierNotFound: {did['name']}")
             rule_id = uuid.uuid4().hex
             self.rules[rule_id] = {
                 "id": rule_id,
@@ -242,10 +285,10 @@ class MockRucio:
                 "rse_expression": rse_expression,
                 "activity": activity,
                 "comment": comment,
-                "state": "OK" if delay == 0 else "REPLICATING",
-                "ready_at": now + timedelta(minutes=delay),
+                "arrivals": {},
                 "expires_at": now + timedelta(seconds=lifetime) if lifetime else None,
             }
+            self._refresh(self.rules[rule_id])
             ids.append(rule_id)
         return ids
 
@@ -259,6 +302,141 @@ class MockRucio:
             )
         return True
 
+    # -- registration (crab_outputs.py) -------------------------------------
+
+    def add_replicas(self, rse: str, files: list[dict[str, Any]]) -> bool:
+        if rse not in self.rses:
+            raise ValueError(f"RSENotFound: {rse}")
+        for f in files:
+            replica = self.replicas.setdefault(
+                f["name"],
+                {"bytes": f["bytes"], "adler32": f.get("adler32"), "rses": []},
+            )
+            if rse not in replica["rses"]:
+                replica["rses"].append(rse)
+        return True
+
+    def get_did(self, scope: str, name: str) -> dict[str, Any]:
+        if name in self.collections:
+            return {
+                "scope": scope,
+                "name": name,
+                "type": self.collections[name]["type"],
+            }
+        if name in self.replicas:
+            return {"scope": scope, "name": name, "type": "FILE"}
+        raise KeyError(f"DataIdentifierNotFound: {name}")
+
+    def _add_collection(self, scope: str, name: str, kind: str) -> bool:
+        if name in self.collections or name in self.replicas:
+            raise ValueError(f"DataIdentifierAlreadyExists: {name}")
+        self.collections[name] = {"scope": scope, "type": kind, "children": []}
+        return True
+
+    def add_container(self, scope: str, name: str) -> bool:
+        return self._add_collection(scope, name, "CONTAINER")
+
+    def add_dataset(self, scope: str, name: str) -> bool:
+        return self._add_collection(scope, name, "DATASET")
+
+    def attach_dids(self, scope: str, name: str, dids: list[dict[str, str]]) -> bool:
+        children = self.collections[name]["children"]
+        for did in dids:
+            self.get_did(did["scope"], did["name"])
+            if did["name"] not in children:
+                children.append(did["name"])
+        return True
+
+    def list_content(self, scope: str, name: str) -> list[dict[str, str]]:
+        return [
+            {"scope": scope, "name": child}
+            for child in self.collections[name]["children"]
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Core-provided: ParcelOutputs, the edge feeder, a catalogue without Rucio
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OutputRow:
+    """One row of ``ParcelOutputs`` (DX-ADR-007), written at ``Done``."""
+
+    output_id: int  # a UUIDv7 in DX-ADR-007; only its order matters here
+    step: str
+    output: str
+    parcel_id: int
+    lfn: str
+    lfn_size: int
+
+
+@dataclass
+class ParcelOutputs:
+    """The ``ParcelOutputs`` table, plus whether each producer has drained."""
+
+    rows: list[OutputRow] = field(default_factory=list)
+    drained: dict[str, bool] = field(default_factory=dict)
+
+    def add(self, step: str, output: str, parcel_id: int, lfn: str, size: int) -> None:
+        self.rows.append(
+            OutputRow(len(self.rows) + 1, step, output, parcel_id, lfn, size)
+        )
+
+    def after(self, step: str, output: str, output_id: int) -> list[OutputRow]:
+        return [
+            r
+            for r in self.rows
+            if r.step == step and r.output == output and r.output_id > output_id
+        ]
+
+
+class EdgeFeederArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str  # "<step>/<output>"
+
+
+def edge_feeder(
+    *,
+    feeder_args: EdgeFeederArgs,
+    feeder_state: dict[str, Any],
+    scouting: bool = False,
+    # remaining arguments are injected
+    outputs: ParcelOutputs,
+) -> Iterator[Any]:
+    """The core's edge feeder (DX-ADR-006): the producer's outputs, in order."""
+    step, port = feeder_args.source.split("/", 1)
+    drained = outputs.drained.get(step, False)  # read before the rows
+    last = int(feeder_state.get("last_output_id", 0))
+    for row in outputs.after(step, port, last):
+        yield FileInput(
+            descriptor={"producer_parcel": row.parcel_id},
+            lfn=row.lfn,
+            lfn_size=row.lfn_size,
+        )
+        last = row.output_id
+    yield SetFeederState({"last_output_id": last})
+    if drained:
+        yield NoMoreInputs()
+
+
+class LocalCatalogue:
+    """The catalogue when there is no Rucio: an LFN policy and nothing else."""
+
+    def register(self, files: list[ProducedFile]) -> list[str]:
+        return [
+            f"/store/local/{f.workgraph}/{f.step}/{f.output}/{f.basename}"
+            for f in files
+        ]
+
+
+REGISTRIES: dict[str, dict[str, Any]] = {
+    "feeder": {**FEEDERS, "Edge": edge_feeder},
+    "packer": {**PACKERS, **RUCIO_PACKERS, **OUTPUT_PACKERS},
+    "hook": HOOKS,
+    "action": {**ACTIONS, **OUTPUT_ACTIONS},
+}
 
 # ---------------------------------------------------------------------------
 # Plugin lookup and invocation
@@ -338,6 +516,9 @@ class TransformationSpec:
     defaults: dict[str, Any]
     status_report: str | None
     actions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    workgraph: str = "workgraph"
+    # data output port -> (intermediate, dirac:RucioRule or None)
+    outputs: dict[str, tuple[bool, dict[str, Any] | None]] = field(default_factory=dict)
 
 
 def compile_workgraph(path: Path) -> list[TransformationSpec]:
@@ -345,6 +526,19 @@ def compile_workgraph(path: Path) -> list[TransformationSpec]:
     if doc.get("class") != "Workflow" or f"{DIRAC}Workgraph" not in _hints(doc):
         raise SubmissionError("A workgraph is a Workflow carrying dirac:Workgraph")
     wf_inputs = _by_id(doc.get("inputs"))
+    declared: dict[str, dict[str, Any] | None] = {}
+    for out_id, out in _by_id(doc.get("outputs")).items():
+        rule = out.get(f"{DIRAC}RucioRule")
+        if rule is not None:
+            try:
+                RucioRuleHint.model_validate(rule)
+            except ValidationError as exc:
+                raise SubmissionError(
+                    f"Invalid dirac:RucioRule on {out_id}: {exc}"
+                ) from exc
+        source = out.get("outputSource")
+        for src in source if isinstance(source, list) else [source]:
+            declared[src] = rule
     specs = []
     for step_id, step in _by_id(doc.get("steps")).items():
         hint = _hints(step).get(f"{DIRAC}Transformation")
@@ -352,19 +546,21 @@ def compile_workgraph(path: Path) -> list[TransformationSpec]:
             raise SubmissionError(f"Step {step_id!r} has no dirac:Transformation hint")
         sources = _sources(step)
         fed = {
-            k: s for k, s in sources.items() if f"{DIRAC}Feeder" in wf_inputs.get(s, {})
+            k: s
+            for k, s in sources.items()
+            if f"{DIRAC}Feeder" in wf_inputs.get(s, {}) or "/" in s
         }
         driving = hint.get("driving_input") or (
             next(iter(fed)) if len(fed) == 1 else None
         )
-        if driving is None or driving not in sources:
+        if driving is None or driving not in fed:
             raise SubmissionError(f"Step {step_id!r} has no unambiguous driving input")
-        if sources[driving] not in fed.values():
-            raise SubmissionError(
-                f"Step {step_id!r} is fed by {sources[driving]!r}: the edge feeder "
-                "is not provided by this local harness"
-            )
-        feeder = wf_inputs[sources[driving]][f"{DIRAC}Feeder"]
+        feeder: dict[str, Any]
+        if "/" in sources[driving]:
+            # Fed by another step's output: the core's edge feeder (DX-ADR-006)
+            feeder = {"name": "Edge", "args": {"source": sources[driving]}}
+        else:
+            feeder = wf_inputs[sources[driving]][f"{DIRAC}Feeder"]
         defaults = {
             k: wf_inputs[s]["default"]
             for k, s in sources.items()
@@ -381,6 +577,12 @@ def compile_workgraph(path: Path) -> list[TransformationSpec]:
             None,
         )
         packer = hint.get("packer") or {"name": "CRABSplitter", "args": {}}
+        outs = [o if isinstance(o, str) else o["id"] for o in step.get("out") or []]
+        data_outputs = {
+            o: (f"{step_id}/{o}" not in declared, declared.get(f"{step_id}/{o}"))
+            for o in outs
+            if o != report
+        }
         specs.append(
             TransformationSpec(
                 step_id=step_id,
@@ -395,6 +597,8 @@ def compile_workgraph(path: Path) -> list[TransformationSpec]:
                 defaults=defaults,
                 status_report=report,
                 actions=hint.get("actions") or {},
+                workgraph=str(doc.get("id") or path.stem).lstrip("#"),
+                outputs=data_outputs,
             )
         )
     return specs
@@ -448,6 +652,9 @@ class LocalCore:
     feeder_enabled: bool = True
     parcels: list[Parcel] = field(default_factory=list)
     finalizing: list[dict[str, Any]] = field(default_factory=list)
+    finalized: bool = False
+    final_pos: int = 0
+    lfns: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Submission-time validation of every plugin binding
@@ -553,6 +760,10 @@ class LocalCore:
                     requirements or None,
                     {**self.spec.defaults, **item.parameters},
                 )
+                prefix = self.spec.defaults.get("output-prefix")
+                if prefix is not None and "output-prefix" not in item.parameters:
+                    # Injected per parcel (DX-ADR-007), as CRAB's <name>_<jobid>
+                    parcel.parameters["output-prefix"] = f"{prefix}_{parcel.id}"
                 for input_id in item.inputs:
                     self.rows[input_id].status = "Assigned"
                     self.rows[input_id].parcel = parcel.id
@@ -568,7 +779,7 @@ class LocalCore:
     # -- dispatch and status report -----------------------------------------
 
     def run_parcel(self, parcel: Parcel, outdir: Path, cwltool: list[str]) -> None:
-        workdir = outdir / "runs" / f"parcel-{parcel.id:04d}"
+        workdir = outdir / self.spec.step_id / "runs" / f"parcel-{parcel.id:04d}"
         workdir.mkdir(parents=True, exist_ok=True)
         job = workdir / "inputs.json"
         job.write_text(json.dumps(parcel.parameters, indent=2))
@@ -580,12 +791,46 @@ class LocalCore:
         )
         (workdir / "cwltool.log").write_text(proc.stderr)
         report: dict[str, Any] = {}
-        if proc.returncode == 0 and self.spec.status_report:
+        outputs: dict[str, Any] = {}
+        if proc.returncode == 0:
             outputs = json.loads(proc.stdout)
+        if self.spec.status_report:
             report_file = outputs.get(self.spec.status_report)
             if report_file:
                 report = json.loads(Path(report_file["path"]).read_text())
         self.apply_report(parcel, report)
+        if parcel.status in {"Done", "PartiallyDone"}:
+            # Completing (DX-ADR-003): register, then record ParcelOutputs
+            self.complete(parcel, outputs)
+
+    def complete(self, parcel: Parcel, outputs: dict[str, Any]) -> None:
+        produced = []
+        sites = (parcel.requirements or {}).get("sites") or ["LOCAL"]
+        for port, (intermediate, rule) in self.spec.outputs.items():
+            value = outputs.get(port) or []
+            for f in value if isinstance(value, list) else [value]:
+                data = Path(f["path"]).read_bytes()
+                produced.append(
+                    ProducedFile(
+                        workgraph=self.spec.workgraph,
+                        step=self.spec.step_id,
+                        output=port,
+                        parcel_id=parcel.id,
+                        site=str(sites[0]),
+                        basename=f["basename"],
+                        bytes=len(data),
+                        adler32=f"{zlib.adler32(data):08x}",
+                        intermediate=intermediate,
+                        rule=rule,
+                    )
+                )
+        catalogue = self.services.get(OutputCatalogue) or LocalCatalogue()
+        lfns = catalogue.register(produced)
+        table = self.services.get(ParcelOutputs)
+        for f, lfn in zip(produced, lfns, strict=True):
+            self.lfns.append(lfn)
+            if table is not None:
+                table.add(f.step, f.output, f.parcel_id, lfn, f.bytes)
 
     def apply_report(self, parcel: Parcel, report: dict[str, Any]) -> None:
         outcomes = set()
@@ -660,16 +905,31 @@ class LocalCore:
             for r in self.rows.values()
         )
 
-    def finalize(self) -> list[dict[str, Any]]:
-        for name, fn, args in self.final_actions:
+    def finalize(self) -> bool:
+        """Run the Finalizing actions from where they stopped; whether they are over.
+
+        A ``Pending`` action is called again on the next cycle; a ``Failed``
+        one stops the sequence.
+        """
+        while self.final_pos < len(self.final_actions):
+            name, fn, args = self.final_actions[self.final_pos]
             if fn is None:
-                self.finalizing.append({"action": name, "result": "Skipped"})
-                continue
-            result = call(fn, self.services, args=args)
-            self.finalizing.append(
-                {"action": name, "result": result.result, "message": result.message}
-            )
-        return self.finalizing
+                entry = {"action": name, "result": "Skipped"}
+            else:
+                result = call(fn, self.services, args=args)
+                entry = {
+                    "action": name,
+                    "result": result.result,
+                    "message": result.message,
+                }
+            del self.finalizing[self.final_pos :]
+            self.finalizing.append(entry)
+            if entry["result"] == "Pending":
+                return False
+            if entry["result"] == "Failed":
+                break
+            self.final_pos += 1
+        return True
 
     def drained(self) -> bool:
         live = {"Unassigned", "Assigned", "Failed"}
@@ -740,6 +1000,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-jobs", type=int, default=10000, help="maxJobsPerTask")
     parser.add_argument("--max-cycles", type=int, default=100)
     parser.add_argument(
+        "--account", default="crabuser", help="Rucio account owning the outputs"
+    )
+    parser.add_argument(
         "--set",
         action="append",
         default=[],
@@ -750,15 +1013,21 @@ def main(argv: list[str] | None = None) -> int:
     extra = {k: json.loads(v) for k, v in (item.split("=", 1) for item in args.set)}
 
     clock = SimClock()
+    table = ParcelOutputs()
     services: dict[Any, Any] = {
         ReplicaCatalogue: JSONReplicas(args.replicas),
         Clock: clock,
+        ParcelOutputs: table,
     }
     if args.dbs:
         services[DBSClient] = JSONDBS(args.dbs)
+    catalogue: RucioOutputCatalogue | None = None
     if args.rucio:
-        services[RucioClient] = MockRucio(args.rucio, clock)
+        rucio = MockRucio(args.rucio, clock)
+        catalogue = RucioOutputCatalogue(rucio, account=args.account)
+        services[RucioClient] = services[RucioOutputClient] = rucio
         services[LockTable] = InMemoryLockTable()
+        services[OutputCatalogue] = services[RucioOutputCatalogue] = catalogue
 
     try:
         specs = compile_workgraph(args.workgraph)
@@ -769,11 +1038,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Submission refused: {exc}", file=sys.stderr)
         return 2
 
-    result = {}
-    for core in cores:
-        cycles = 0
-        for _ in range(args.max_cycles):
-            core.sweep_feeder()
+    # One cycle runs every transformation in document order, so that a
+    # consumer sees in the same cycle what its producer registered.
+    cycles = 0
+    cwltool = shlex.split(args.cwltool)
+    for _ in range(args.max_cycles):
+        busy = waiting = False
+        for core in cores:
+            inserted = core.sweep_feeder()
             new = core.sweep_packer(flush=args.flush)
             if len([p for p in core.parcels if p.kind == "compute"]) > args.max_jobs:
                 print(
@@ -784,17 +1056,22 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             if args.run:
                 for parcel in new:
-                    core.run_parcel(parcel, args.outdir, shlex.split(args.cwltool))
-            cycles += 1
-            waiting = core.waiting()
-            clock.advance(timedelta(minutes=args.cycle_minutes))
-            if waiting:
-                continue
-            if not args.run or core.drained() or not (new or core.feeder_enabled):
-                break
-        if core.drained():
-            core.finalize()
+                    core.run_parcel(parcel, args.outdir, cwltool)
+            table.drained[core.spec.step_id] = core.drained()
+            if core.drained() and not core.finalized:
+                core.finalized = core.finalize()
+                busy |= not core.finalized
+            waiting |= core.waiting()
+            busy |= bool(inserted or new)
+        cycles += 1
+        clock.advance(timedelta(minutes=args.cycle_minutes))
+        if waiting:
+            continue
+        if not args.run or not busy:
+            break
 
+    result: dict[str, Any] = {}
+    for core in cores:
         stepdir = args.outdir / core.spec.step_id
         (stepdir / "parcels").mkdir(parents=True, exist_ok=True)
         for parcel in core.parcels:
@@ -814,13 +1091,28 @@ def main(argv: list[str] | None = None) -> int:
             "summary": summary,
             "cycles": cycles,
         }
+        if core.lfns:
+            result[core.spec.step_id]["outputs"] = core.lfns
         if core.finalizing:
             result[core.spec.step_id]["finalizing"] = core.finalizing
-        if LockTable in services:
+        if LockTable in typing.get_type_hints(core.packer_fn).values():
             result[core.spec.step_id]["locks"] = {
                 lock.lfn: {"rse": lock.rse, "reroutes": lock.reroutes}
                 for lock in sorted(services[LockTable].all(), key=lambda x: x.lfn)
             }
+    if catalogue is not None and catalogue.rules:
+        rules = {}
+        for rule_id, (kind, name) in sorted(
+            catalogue.rules.items(), key=lambda x: x[1]
+        ):
+            rule = catalogue.rucio.get_replication_rule(rule_id)
+            rules[name] = {
+                "kind": kind,
+                "rse_expression": rule["rse_expression"],
+                "state": rule["state"],
+                "expires_at": rule.get("expires_at"),
+            }
+        result["rucio_rules"] = rules
     print(json.dumps(result, indent=2, default=str))
     return 0
 

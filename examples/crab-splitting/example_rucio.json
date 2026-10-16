@@ -4,7 +4,11 @@
     "T2_IT_Pisa": {"transfer_minutes": 30, "stuck": true},
     "T1_IT_CNAF_Disk": {"transfer_minutes": 10},
     "T1_IT_CNAF_Tape": {"tape": true, "recall_minutes": 120},
-    "T2_DE_DESY": {"transfer_minutes": 30}
+    "T2_DE_DESY": {"transfer_minutes": 30},
+    "T2_IT_Legnaro_Temp": {"temp": true},
+    "T2_IT_Pisa_Temp": {"temp": true},
+    "T1_IT_CNAF_Temp": {"temp": true},
+    "T2_DE_DESY_Temp": {"temp": true}
   },
   "replicas": {
     "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f1.root": {"bytes": 1000000, "rses": ["T2_IT_Legnaro"]},

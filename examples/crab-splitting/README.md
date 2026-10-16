@@ -17,21 +17,25 @@ describes what each job runs, and it can still be run unchanged by a stock `cwlt
 
 ## Contents
 
-| File                         | Role                                                                                                                                              |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `crab_plugins.py`            | The plugins: `CRABDBS` and `CRABPrivateMC` feeders, `CRABSplitter` packer, `CRABHandleFailedInput` hook                                           |
-| `adr006.py`                  | Local stand-ins for the DX-ADR-006 proposal types (`FileInput`, `ComputeParcel`, `SplitInto`, …)                                                  |
-| `crab-analysis.cwl`          | Workgraph for a CRAB Analysis task (DBS dataset, lumi mask, `LumiBased`)                                                                          |
-| `crab-privatemc.cwl`         | Workgraph for a CRAB PrivateMC task (`EventBased`)                                                                                                |
-| `transformations/cmsrun.cwl` | The process each parcel runs: a mock `cmsRun` that writes the DX-ADR-007 status report                                                            |
-| `local_core.py`              | A local stand-in for the core: compiles the document and runs the feeder → packer → dispatch loop                                                 |
-| `example_dbs.json`           | A DBS dump, the local metadata catalogue                                                                                                          |
-| `example_replicas.json`      | The local replica map (DX-ADR-007)                                                                                                                |
-| `test_crab_plugins.py`       | Tests                                                                                                                                             |
-| `crab_rucio.py`              | Second example: `CRABRucioSplitter` packer and `CRABReleaseInputLocks` action ([below](#second-example-lock-the-input-with-rucio-before-packing)) |
-| `crab-analysis-rucio.cwl`    | Workgraph for a CRAB Analysis task whose input is locked with Rucio at the job's site                                                             |
-| `example_rucio.json`         | RSEs and replicas for the mock Rucio of `local_core.py --rucio`                                                                                   |
-| `test_crab_rucio.py`         | Tests of the second example                                                                                                                       |
+| File                         | Role                                                                                                                                                                                                          |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crab_plugins.py`            | The plugins: `CRABDBS` and `CRABPrivateMC` feeders, `CRABSplitter` packer, `CRABHandleFailedInput` hook                                                                                                       |
+| `adr006.py`                  | Local stand-ins for the DX-ADR-006 proposal types (`FileInput`, `ComputeParcel`, `SplitInto`, …)                                                                                                              |
+| `crab-analysis.cwl`          | Workgraph for a CRAB Analysis task (DBS dataset, lumi mask, `LumiBased`)                                                                                                                                      |
+| `crab-privatemc.cwl`         | Workgraph for a CRAB PrivateMC task (`EventBased`)                                                                                                                                                            |
+| `transformations/cmsrun.cwl` | The process each parcel runs: a mock `cmsRun` that writes the DX-ADR-007 status report                                                                                                                        |
+| `local_core.py`              | A local stand-in for the core: compiles the document and runs the feeder → packer → dispatch loop                                                                                                             |
+| `example_dbs.json`           | A DBS dump, the local metadata catalogue                                                                                                                                                                      |
+| `example_replicas.json`      | The local replica map (DX-ADR-007)                                                                                                                                                                            |
+| `test_crab_plugins.py`       | Tests                                                                                                                                                                                                         |
+| `crab_rucio.py`              | Second example: `CRABRucioSplitter` packer and `CRABReleaseInputLocks` action ([below](#second-example-lock-the-input-with-rucio-before-packing))                                                             |
+| `crab-analysis-rucio.cwl`    | Workgraph for a CRAB Analysis task whose input is locked with Rucio at the job's site                                                                                                                         |
+| `example_rucio.json`         | RSEs and replicas for the mock Rucio of `local_core.py --rucio`                                                                                                                                               |
+| `test_crab_rucio.py`         | Tests of the second example                                                                                                                                                                                   |
+| `crab_outputs.py`            | Third example: `RucioOutputCatalogue`, `CRABMerge` packer, `CRABWaitForTransfers` and `CRABReleaseIntermediates` actions ([below](#third-example-register-the-outputs-in-rucio-merge-them-and-transfer-them)) |
+| `crab-analysis-merge.cwl`    | Workgraph: analysis on locked input → merge by size → Rucio rule to the storage site                                                                                                                          |
+| `transformations/merge.cwl`  | The process each merge parcel runs: a mock EDM merge                                                                                                                                                          |
+| `test_crab_outputs.py`       | Tests of the third example                                                                                                                                                                                    |
 
 ## Mapping CRAB to the Transformation System
 
@@ -100,8 +104,11 @@ python3 local_core.py crab-privatemc.cwl --run
 # Rucio input locks (second example, below): simulated time, mock Rucio
 python3 local_core.py crab-analysis-rucio.cwl --dbs example_dbs.json --rucio example_rucio.json --run
 
+# Outputs registered in Rucio, merged and transferred (third example, below)
+python3 local_core.py crab-analysis-merge.cwl --dbs example_dbs.json --rucio example_rucio.json --run
+
 # Tests (outside the repository's pytest configuration)
-python3 -m pytest -c /dev/null -p no:cacheprovider test_crab_plugins.py test_crab_rucio.py
+python3 -m pytest -c /dev/null -p no:cacheprovider test_crab_plugins.py test_crab_rucio.py test_crab_outputs.py
 ```
 
 Requirements: `pydantic`, `pyyaml`, and `cwltool` with node.js for `--run`.
@@ -310,3 +317,118 @@ provides:
 5. **Releasing per parcel.** Locks are released at Finalizing. Releasing a file as soon as all of
     its inputs are `Processed` would need a hook on input or parcel completion, which DX-ADR-006 does
     not define.
+
+## Third example: register the outputs in Rucio, merge them and transfer them
+
+`crab-analysis-merge.cwl` keeps the analysis step of the second example and adds what CRAB does
+after a job ends: stage-out, publication of the files in Rucio, and ASO (asynchronous stage-out) to
+the user's storage site. It follows CRAB's Rucio ASO model:
+
+1. The job writes its output to the Temp area of the site it ran at.
+2. The file is registered there under its final LFN and attached to a dataset of the user's output
+    container.
+3. One replication rule on the container moves everything to `Site.storageSite`.
+
+A merge step in between, like WMCore's merge tasks, merges the small files where they were produced,
+so only the merged files are transferred.
+
+```
+analysis (CRABRucioSplitter)            merge (CRABMerge, fed by the edge feeder)
+  -> crab_analysis_<n>.root               -> crab_merged_<n>.root
+     /store/temp/user/<account>/...          /store/user/<account>/...
+     at <site>_Temp, pinned                  at <site>_Temp, in the output container
+     (intermediate)                          dirac:RucioRule -> T2_DE_DESY
+```
+
+### Where it fits in the ADRs
+
+| Concern                       | ADR                                                                                                                                                                                                                                                                                                   | Here                                                                                                                                                                                                                   |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Registering outputs           | DX-ADR-003: the core registers the outputs into the installation's catalogues while the parcel is `Completing`. This step is re-entrant, so `Done` means registered, and a failed parcel registers nothing.                                                                                           | `RucioOutputCatalogue.register`, called by `LocalCore.complete` before the `ParcelOutputs` rows are written. Every call can be repeated: DIDs are checked with `get_did`, and rules are found again by their comment.  |
+| Intermediate vs final outputs | DX-ADR-007: `TransformationOutputs.Intermediate` is true when a step output is not a workgraph output. An intermediate can be removed once its consumers are done.                                                                                                                                    | Intermediates go under `/store/temp/user` and are pinned at the Temp RSE by a rule with a lifetime. Workgraph outputs go under `/store/user`, in the container that the rule moves.                                    |
+| Merging                       | DX-ADR-006/007: a step fed by another step's output gets the core's edge feeder, which feeds the producer's `ParcelOutputs` in order. Its bookmark is the last output fed, and it reports `NoMoreInputs` once the producer has drained. The ADR's sprucing example merges in a second transformation. | The `merge` step, packer `CRABMerge`: merge by size (WMCore `ParentlessMergeBySize`), per RSE, with the job sent to that RSE's site. The remainder is held back until the analysis step has drained.                   |
+| Transferring                  | DX-ADR-008: Rucio is not a data backend, because a rule is a standing declaration rather than a request that completes. "Rucio rules for workgraph outputs" is an open issue left to the communities.                                                                                                 | A `dirac:RucioRule` field on the workgraph output (proposal below). The catalogue creates the rule once, on the container, so files registered later are covered by the same rule. No data transformation is involved. |
+| Task completion               | DX-ADR-006: `Finalizing` actions run once the transformation has drained. They can be `Pending`.                                                                                                                                                                                                      | `CRABWaitForTransfers` is `Pending` while the rule is replicating, `Failed` if it is `STUCK`, and `Passed` once it is `OK`. `CRABReleaseIntermediates` then shortens the pins of the unmerged files to `grace_hours`.  |
+
+The proposed `dirac:RucioRule` field on a workgraph output parameter:
+
+| Field            | Meaning                                                                         | CRAB equivalent         |
+| ---------------- | ------------------------------------------------------------------------------- | ----------------------- |
+| `rse_expression` | Where the output must end up (required)                                         | `Site.storageSite`      |
+| `container`      | The output container; defaults to `/<workgraph>/<account>-<step>-<output>/USER` | `Data.outputDatasetTag` |
+| `lifetime_days`  | Lifetime of the rule; none by default                                           | —                       |
+| `activity`       | The FTS activity; `User Subscriptions` by default                               | ASO's activity          |
+| `copies`         | Number of copies; 1 by default                                                  | —                       |
+
+Without a merge step, the same field goes on an output sourced from the analysis step: its files are
+then registered under `/store/user` and transferred directly, as CRAB does without merging (see
+`test_end_to_end_transfer_without_merge`).
+
+### What the catalogue does with each produced file
+
+For a file of parcel `n`, at `<site>_Temp`, where `<site>` is the parcel's `requirements.sites[0]`
+(the site the job ran at):
+
+1. Compute the LFN: `/store[/temp]/user/<account>/<workgraph>/<step>/<output>/<prefix>_<n>.root`.
+    The core injects the per-parcel `output-prefix`, as CRAB names files `<name>_<jobid>.root`.
+2. Call `add_replicas` at the Temp RSE, with the size and the adler32 checksum.
+3. Attach the file to the dataset `<container>#<rse>`. The dataset is created, and attached to the
+    container, on first use.
+4. For an intermediate, pin the dataset at the Temp RSE for `intermediate_lifetime_days`, so the
+    site's Temp cleanup does not remove it before the merge reads it. For a workgraph output with a
+    `dirac:RucioRule`, create the container rule, once.
+
+The rules are remembered by the catalogue for the Finalizing actions. In production this would be an
+extension table, like the lock table of the second example.
+
+### The run in `example_rucio.json`
+
+| Step     | Parcels | Result                                                                                                                                                                                           |
+| -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| analysis | 5       | 4 unmerged files at `T2_IT_Legnaro_Temp` and 1 at `T1_IT_CNAF_Temp`, pinned for 7 days. Then `CRABReleaseInputLocks`.                                                                            |
+| merge    | 3       | 3 Legnaro files reach `max_merge_files` and are merged as soon as they are registered. The last Legnaro file and the CNAF file are merged at their own sites once the analysis step drains.      |
+| Finalize | —       | The container rule to `T2_DE_DESY` replicates for 30 simulated minutes. `CRABWaitForTransfers` is `Pending`, then `Passed`, and `CRABReleaseIntermediates` lets the two pins expire in 24 hours. |
+
+The merge sizes in the example are a few hundred bytes, to suit the mock outputs.
+
+### Integration
+
+On top of the plan for the first two examples:
+
+- **Catalogue interface.** The core needs a catalogue interface for the `Completing` step:
+    `OutputCatalogue.register(files) -> lfns`, called with the files of one parcel. It must be
+    idempotent. `ProducedFile` carries what the core knows about each file: workgraph, step, output
+    port, parcel, site, name, size, checksum, the intermediate flag, and the output's `dirac:` rule.
+    The CMS extension registers `RucioOutputCatalogue` for its installation, with the account of the
+    workgraph's owner.
+- **Workgraph hint.** `dirac:RucioRule` is added to the extension's hint schema and is validated at
+    submission (`compile_workgraph` refuses an invalid one).
+- **Edge feeder in the harness.** `local_core.py` now provides the edge feeder, the `ParcelOutputs`
+    table and the per-parcel `output-prefix`. It runs every transformation of the workgraph in each
+    cycle, in document order, and keeps calling a `Pending` Finalizing action on later cycles.
+
+### Open issues specific to outputs
+
+1. **Rucio rules for workgraph outputs** (DX-ADR-008 open issue). `dirac:RucioRule` is one answer:
+    the rule belongs to the workgraph output, is created by the catalogue at registration, and is
+    waited on at Finalizing. An alternative is a `Finalizing` action that creates the rule once the
+    step has drained. That is simpler, but no transfer starts before the end of the task.
+2. **No catalogue plugin point.** DX-ADR-003 says outputs are registered "into the installation's
+    catalogue(s)" but does not define the interface or how it receives per-output settings. The
+    draft passes the `dirac:` fields of the workgraph output through to the catalogue.
+3. **Where the file is.** The Temp RSE is inferred from the parcel's site. In production the job
+    wrapper reports where it uploaded each file (DX-ADR-007 "abandoned uploads"), and that location
+    should be given to the catalogue instead.
+4. **Intermediate removal.** DX-ADR-007 removes an intermediate once its consumers are done. Here
+    that is a lifetime on the Temp pin, shortened by `CRABReleaseIntermediates` at the end of the
+    merge step. Releasing per merged parcel would need the same completion hook as the per-parcel
+    lock release.
+5. **Rule ownership.** The rule is owned by the account that registers the files, so it counts
+    against that account's quota at the destination. Whether that is the user's account (as in CRAB)
+    or a service account acting for the user is a policy for the extension.
+6. **Duplicates on retry.** A real Rucio raises `FileAlreadyExists`/`DuplicateContent` when a replica
+    or attachment is registered twice. The mock accepts duplicates, so a real implementation must
+    catch these errors to stay re-entrant.
+7. **Task status.** A transfer that is `STUCK` fails the Finalizing action, so the task does not
+    end as complete. Whether the core should retry (re-route the rule) or stop for an operator is
+    not specified by DX-ADR-006.

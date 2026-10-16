@@ -1,0 +1,6 @@
+{
+  "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f1.root": {"replicas": ["T2_IT_Legnaro"], "size": 1000000},
+  "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f2.root": {"replicas": ["T2_IT_Legnaro"], "size": 800000},
+  "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f3.root": {"replicas": ["T1_IT_CNAF", "T2_IT_Pisa"], "size": 600000},
+  "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f4.root": {"replicas": ["T2_IT_Legnaro"], "size": 200000}
+}

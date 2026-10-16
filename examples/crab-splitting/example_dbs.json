@@ -1,0 +1,8 @@
+{
+  "/Muon/Run2024A-PromptReco-v1/MINIAOD": [
+    {"lfn": "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f1.root", "events": 3000, "size": 1000000, "runs": {"1": [1, 2, 3], "2": [1, 2, 3]}},
+    {"lfn": "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f2.root", "events": 2000, "size": 800000, "runs": {"2": [4, 5, 6, 7]}},
+    {"lfn": "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f3.root", "events": 1500, "size": 600000, "runs": {"3": [1, 2, 3]}},
+    {"lfn": "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f4.root", "events": 500, "size": 200000, "runs": {"4": [1]}}
+  ]
+}

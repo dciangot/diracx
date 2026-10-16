@@ -17,17 +17,21 @@ describes what each job runs, and it can still be run unchanged by a stock `cwlt
 
 ## Contents
 
-| File                         | Role                                                                                                    |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `crab_plugins.py`            | The plugins: `CRABDBS` and `CRABPrivateMC` feeders, `CRABSplitter` packer, `CRABHandleFailedInput` hook |
-| `adr006.py`                  | Local stand-ins for the DX-ADR-006 proposal types (`FileInput`, `ComputeParcel`, `SplitInto`, …)        |
-| `crab-analysis.cwl`          | Workgraph for a CRAB Analysis task (DBS dataset, lumi mask, `LumiBased`)                                |
-| `crab-privatemc.cwl`         | Workgraph for a CRAB PrivateMC task (`EventBased`)                                                      |
-| `transformations/cmsrun.cwl` | The process each parcel runs: a mock `cmsRun` that writes the DX-ADR-007 status report                  |
-| `local_core.py`              | A local stand-in for the core: compiles the document and runs the feeder → packer → dispatch loop       |
-| `example_dbs.json`           | A DBS dump, the local metadata catalogue                                                                |
-| `example_replicas.json`      | The local replica map (DX-ADR-007)                                                                      |
-| `test_crab_plugins.py`       | Tests                                                                                                   |
+| File                         | Role                                                                                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crab_plugins.py`            | The plugins: `CRABDBS` and `CRABPrivateMC` feeders, `CRABSplitter` packer, `CRABHandleFailedInput` hook                                           |
+| `adr006.py`                  | Local stand-ins for the DX-ADR-006 proposal types (`FileInput`, `ComputeParcel`, `SplitInto`, …)                                                  |
+| `crab-analysis.cwl`          | Workgraph for a CRAB Analysis task (DBS dataset, lumi mask, `LumiBased`)                                                                          |
+| `crab-privatemc.cwl`         | Workgraph for a CRAB PrivateMC task (`EventBased`)                                                                                                |
+| `transformations/cmsrun.cwl` | The process each parcel runs: a mock `cmsRun` that writes the DX-ADR-007 status report                                                            |
+| `local_core.py`              | A local stand-in for the core: compiles the document and runs the feeder → packer → dispatch loop                                                 |
+| `example_dbs.json`           | A DBS dump, the local metadata catalogue                                                                                                          |
+| `example_replicas.json`      | The local replica map (DX-ADR-007)                                                                                                                |
+| `test_crab_plugins.py`       | Tests                                                                                                                                             |
+| `crab_rucio.py`              | Second example: `CRABRucioSplitter` packer and `CRABReleaseInputLocks` action ([below](#second-example-lock-the-input-with-rucio-before-packing)) |
+| `crab-analysis-rucio.cwl`    | Workgraph for a CRAB Analysis task whose input is locked with Rucio at the job's site                                                             |
+| `example_rucio.json`         | RSEs and replicas for the mock Rucio of `local_core.py --rucio`                                                                                   |
+| `test_crab_rucio.py`         | Tests of the second example                                                                                                                       |
 
 ## Mapping CRAB to the Transformation System
 
@@ -93,8 +97,11 @@ python3 local_core.py crab-analysis.cwl --dbs example_dbs.json --replicas exampl
 # PrivateMC
 python3 local_core.py crab-privatemc.cwl --run
 
+# Rucio input locks (second example, below): simulated time, mock Rucio
+python3 local_core.py crab-analysis-rucio.cwl --dbs example_dbs.json --rucio example_rucio.json --run
+
 # Tests (outside the repository's pytest configuration)
-python3 -m pytest -c /dev/null -p no:cacheprovider test_crab_plugins.py
+python3 -m pytest -c /dev/null -p no:cacheprovider test_crab_plugins.py test_crab_rucio.py
 ```
 
 Requirements: `pydantic`, `pyyaml`, and `cwltool` with node.js for `--run`.
@@ -183,3 +190,123 @@ DiracX core provides only the generic machinery the ADRs define.
 6. **The `maxJobsPerTask` guard for data tasks.** The parcel count for a data task is only known
     after packing, so the guard cannot be a submission check. Candidates are an `Approving` action
     that extrapolates from the scout, or an `Active` hook that disables the feeder.
+
+## Second example: lock the input with Rucio before packing
+
+The request: lock the input data, and wait until it is at the site a job will run at before creating
+the job's parcel, using Rucio. `crab-analysis-rucio.cwl` is `crab-analysis.cwl` with the packer
+replaced by `CRABRucioSplitter`. That packer is in `crab_rucio.py` and reuses the `CRABSplitter`
+grouping.
+
+### Where it fits in the ADRs
+
+The ADRs already have a place for this wait, and it is the packer:
+
+- DX-ADR-005: an input stays `Unassigned` with a `DelayedUntil` while "the packer asks for the
+    delay, for example because a file is not yet at the storage element the transformation needs".
+- DX-ADR-008: "a transformation that needs files another one has replicated [...] its packer delays
+    each input until the replica exists".
+- DX-ADR-008: "a destination is a decision with memory [...] the assignment table belongs to its
+    extension".
+
+So the lock and the wait are a packer concern, and its memory is an extension table. Two
+alternatives fit worse:
+
+- **Rucio as a data backend**, where a lock is a `DataParcel` that completes when the rule is OK.
+    DX-ADR-008 rejects this explicitly: a rule is a standing declaration, not a request that
+    completes.
+- **A separate staging transformation upstream.** Data transformations are sinks (DX-ADR-008), so
+    the compute step could not be edge-fed from it. It would still need the same delay in its packer,
+    and it would have to choose a destination without knowing where the job will run, which is the
+    packing decision.
+
+### What the packer does with each claimed input
+
+```mermaid
+flowchart TD
+    I[Unassigned input] --> L{Lock for this LFN<br/>in the LockTable?}
+    L -- no --> C[Choose destination RSE:<br/>a candidate with a replica,<br/>else first with quota left]
+    C --> R[Create the Rucio rule<br/>or adopt this task's existing one]
+    R --> T[(LockTable: lfn -> rse, rule)]
+    L -- yes --> S{Rule state}
+    T --> S
+    S -- OK --> P[Pack with CRABSplitter, location = destination site<br/>-> ComputeParcel with requirements.sites]
+    S -- REPLICATING ... --> D[DelayInput poll_minutes]
+    S -- STUCK or older than max_wait_hours --> X{reroutes left?}
+    X -- yes --> M[Release the rule, lock at the next candidate] --> D
+    X -- no --> B[BadInput -> Problematic]
+```
+
+- **One lock per LFN, not per input.** Every lumi chunk of a file shares the same rule and the same
+    destination, through the extension's `LockTable`.
+- **Destination choice.** The packer tries the candidates in `destinations` (CRAB's
+    `Site.whitelist`, as disk RSEs) in order:
+    - A candidate that already holds the file wins, and the rule only pins the replica there.
+    - Otherwise the first candidate that is within `destination_quota_bytes` is chosen. This fills one
+        site before the next, which keeps the files of a job together. Pinned bytes count against the
+        quota too, as they do in a Rucio account's usage.
+- **Tape-only files.** These need nothing extra: the rule at a disk RSE makes Rucio recall the file
+    from tape and transfer it.
+- **Idempotent.** The rule's `comment` identifies the task. If the packer task dies between creating
+    the rule and writing the table, the next sweep finds and adopts the rule instead of creating
+    another one, which Rucio would refuse as a `DuplicateRule` anyway.
+- **Parcels wait for transfers to their own site only.** A partial group for a site is held back
+    only while a transfer to that same site is still running. A transfer still running to CNAF does
+    not hold back a Legnaro job.
+- **The parcel runs where its data is.** `requirements.sites` is the destination's site, and
+    `metadata.locks` records which RSE each file was locked at.
+- **Release.** The `CRABReleaseInputLocks` Finalizing action shortens every rule of the task to
+    `grace_hours`, and Rucio expires them. The rules carry `lock_lifetime_days` from the start, so the
+    locks also expire if the task is abandoned.
+
+The injected services are typed by protocols:
+
+- `RucioClient` is the subset of `rucio.client.Client` the plugins call: `list_replicas`,
+    `list_did_rules`, `add_replication_rule`, `get_replication_rule` and `update_replication_rule`. A
+    real client satisfies it as is.
+- `LockTable` is the extension's table, one row per (transformation, LFN).
+- `Clock` exists so that the harness can simulate time.
+
+### The run in `example_rucio.json`
+
+| File | Where it is                   | What happens                                                                                                                   | Parcel created |
+| ---- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | -------------- |
+| f1   | `T2_IT_Legnaro`               | Pinned in place, rule `OK` at once                                                                                             | cycle 0        |
+| f2   | `T2_IT_Legnaro`               | Pinned in place, rule `OK` at once                                                                                             | cycle 0        |
+| f4   | `T2_DE_DESY`, not whitelisted | Replicated to Legnaro, which still has quota, in 30 min                                                                        | cycle 2        |
+| f3   | `T1_IT_CNAF_Tape` only        | Legnaro is over quota, so the rule goes to `T2_IT_Pisa`, which goes `STUCK`. It is re-routed to `T1_IT_CNAF_Disk` and recalled | cycle 19       |
+
+Each cycle is 15 simulated minutes. After the last parcel, the Finalizing action releases the four
+locks.
+
+### Integration
+
+The integration follows the same plan as the first example, with one addition. The CMS extension
+provides:
+
+- the Rucio client, as a DX-ADR-001 dependency built from the task's (or a service) account;
+- a `LockTable` backed by an extension-owned table keyed on `(TransformationID, LFN)`.
+
+`MockRucio` and `InMemoryLockTable` in `local_core.py` stand in for them here.
+
+### Open issues specific to locking
+
+1. **Side effects in a packer.** DX-ADR-006 says that plugins propose and the core writes, but
+    creating a rule is an external write. The draft makes it safe to repeat (adopting the rule by its
+    comment), and the lock table is the extension's own. Whether DX-ADR-006 should name "external
+    reservations made by a packer" explicitly, or offer a hook that runs before packing, is worth
+    raising.
+2. **Shared rules.** Rucio refuses a second rule for the same DID, account and RSE expression. Two
+    tasks of one account locking the same file at the same RSE therefore need to share one rule,
+    which means reference counting before a release. Alternatives are a rule per task through a
+    distinct account, or a cross-transformation lock table.
+3. **The input is delayed, not the parcel.** The packer holds inputs until they are ready, so a
+    parcel never waits in `Assigned`. The cost is a `get_replication_rule` call per locked file per
+    sweep. Polling per rule could become per dataset (CMS block) if rules were created per block,
+    which would also be closer to CRAB's tape recall, at the cost of coarser destination choices.
+4. **The core does not see the locked bytes.** They are outside the DX-ADR-009 counters
+    (DX-ADR-008: "files a rule moves are outside the counters"). The quota check reads the lock
+    table, and the authoritative limit is the Rucio account quota.
+5. **Releasing per parcel.** Locks are released at Finalizing. Releasing a file as soon as all of
+    its inputs are `Processed` would need a hook on input or parcel completion, which DX-ADR-006 does
+    not define.

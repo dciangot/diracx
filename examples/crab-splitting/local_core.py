@@ -18,6 +18,13 @@ workgraph documents next to it can be run end to end on a laptop:
    and run the step's process with a stock ``cwltool``; read the job's
    status report (DX-ADR-007) and apply it, calling ``HandleFailedInput``
    for failures (DX-ADR-005).
+5. **Finalizing** (DX-ADR-006): once the transformation has drained, run the
+   ``Finalizing`` actions this harness knows about; the others are reported
+   as skipped.
+
+Time is simulated: each cycle advances a clock by ``--cycle-minutes``, and
+cycles continue while inputs are delayed (``DelayInput``), so that a packer
+waiting on a transfer (``crab_rucio.py``) runs to completion in seconds.
 
 Plugins are looked up through entry points first (the integration plan's
 groups below) and then in the ``crab_plugins`` registries.
@@ -26,6 +33,8 @@ Usage::
 
     python3 local_core.py crab-analysis.cwl --dbs example_dbs.json \\
         --replicas example_replicas.json --outdir out [--scouting] [--run]
+    python3 local_core.py crab-analysis-rucio.cwl --dbs example_dbs.json \\
+        --rucio example_rucio.json --outdir out [--run]
 """
 
 from __future__ import annotations
@@ -41,7 +50,7 @@ import typing
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any
@@ -68,14 +77,28 @@ from crab_plugins import (
     DBSClient,
     ReplicaCatalogue,
 )
+from crab_rucio import ACTIONS, Clock, InputLock, LockTable, RucioClient
+from crab_rucio import PACKERS as RUCIO_PACKERS
 from pydantic import BaseModel, ValidationError
 
 ENTRY_POINT_GROUPS = {
     "feeder": "diracx.transformations.feeders",
     "packer": "diracx.transformations.packers",
     "hook": "diracx.transformations.hooks",
+    "action": "diracx.transformations.actions",
 }
-ARGS_PARAMETER = {"feeder": "feeder_args", "packer": "packer_args", "hook": "args"}
+ARGS_PARAMETER = {
+    "feeder": "feeder_args",
+    "packer": "packer_args",
+    "hook": "args",
+    "action": "args",
+}
+REGISTRIES: dict[str, dict[str, Any]] = {
+    "feeder": FEEDERS,
+    "packer": {**PACKERS, **RUCIO_PACKERS},
+    "hook": HOOKS,
+    "action": ACTIONS,
+}
 DIRAC = "dirac:"
 
 
@@ -110,6 +133,133 @@ class JSONReplicas:
         return list(self._data.get(lfn, {}).get("replicas", []))
 
 
+class SimClock:
+    """Simulated time, advanced by the CLI loop."""
+
+    def __init__(self, start: datetime | None = None) -> None:
+        self.t = start or datetime.now(timezone.utc)
+
+    def now(self) -> datetime:
+        return self.t
+
+    def advance(self, delta: timedelta) -> None:
+        self.t += delta
+
+
+class InMemoryLockTable:
+    """The extension's lock table (a database table in production)."""
+
+    def __init__(self) -> None:
+        self._locks: dict[str, InputLock] = {}
+
+    def get(self, lfn: str) -> InputLock | None:
+        return self._locks.get(lfn)
+
+    def put(self, lock: InputLock) -> None:
+        self._locks[lock.lfn] = lock
+
+    def all(self) -> list[InputLock]:
+        return list(self._locks.values())
+
+
+class MockRucio:
+    """Enough of ``rucio.client.Client`` to watch rules progress in simulated time.
+
+    The JSON file holds ``{"rses": {rse: {...}}, "replicas": {lfn: {...}}}``.
+    A rule at an RSE that already has the file is ``OK`` at once. Otherwise
+    it is ``REPLICATING`` for the destination's ``transfer_minutes``, plus the
+    source's ``recall_minutes`` when every source is a tape, and then ``OK``
+    (the replica appears at the destination), or ``STUCK`` if the destination
+    is marked ``stuck``.
+    """
+
+    def __init__(self, path: Path, clock: SimClock) -> None:
+        data = json.loads(path.read_text())
+        self.rses: dict[str, dict[str, Any]] = data["rses"]
+        self.replicas: dict[str, dict[str, Any]] = data["replicas"]
+        self.clock = clock
+        self.rules: dict[str, dict[str, Any]] = {}
+
+    def _refresh(self, rule: dict[str, Any]) -> dict[str, Any]:
+        now = self.clock.now()
+        if rule["state"] == "REPLICATING" and now >= rule["ready_at"]:
+            if self.rses[rule["rse_expression"]].get("stuck"):
+                rule["state"] = "STUCK"
+            else:
+                rule["state"] = "OK"
+                rses = self.replicas[rule["name"]]["rses"]
+                if rule["rse_expression"] not in rses:
+                    rses.append(rule["rse_expression"])
+        return rule
+
+    def list_replicas(self, dids: list[dict[str, str]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "scope": did["scope"],
+                "name": did["name"],
+                "bytes": self.replicas[did["name"]]["bytes"],
+                "rses": {rse: [] for rse in self.replicas[did["name"]]["rses"]},
+            }
+            for did in dids
+            if did["name"] in self.replicas
+        ]
+
+    def list_did_rules(self, scope: str, name: str) -> list[dict[str, Any]]:
+        return [
+            self._refresh(r)
+            for r in self.rules.values()
+            if r["scope"] == scope and r["name"] == name
+        ]
+
+    def add_replication_rule(
+        self,
+        dids: list[dict[str, str]],
+        copies: int,
+        rse_expression: str,
+        lifetime: int | None = None,
+        activity: str | None = None,
+        comment: str | None = None,
+    ) -> list[str]:
+        if rse_expression not in self.rses:
+            raise ValueError(f"InvalidRSEExpression: {rse_expression}")
+        now = self.clock.now()
+        ids = []
+        for did in dids:
+            sources = self.replicas[did["name"]]["rses"]
+            delay = 0.0
+            if rse_expression not in sources:
+                delay = self.rses[rse_expression].get("transfer_minutes", 0)
+                if all(self.rses.get(s, {}).get("tape") for s in sources):
+                    delay += max(
+                        self.rses.get(s, {}).get("recall_minutes", 0) for s in sources
+                    )
+            rule_id = uuid.uuid4().hex
+            self.rules[rule_id] = {
+                "id": rule_id,
+                "scope": did["scope"],
+                "name": did["name"],
+                "copies": copies,
+                "rse_expression": rse_expression,
+                "activity": activity,
+                "comment": comment,
+                "state": "OK" if delay == 0 else "REPLICATING",
+                "ready_at": now + timedelta(minutes=delay),
+                "expires_at": now + timedelta(seconds=lifetime) if lifetime else None,
+            }
+            ids.append(rule_id)
+        return ids
+
+    def get_replication_rule(self, rule_id: str) -> dict[str, Any]:
+        return self._refresh(self.rules[rule_id])
+
+    def update_replication_rule(self, rule_id: str, options: dict[str, Any]) -> bool:
+        if "lifetime" in options:
+            self.rules[rule_id]["expires_at"] = self.clock.now() + timedelta(
+                seconds=options["lifetime"]
+            )
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Plugin lookup and invocation
 # ---------------------------------------------------------------------------
@@ -119,7 +269,7 @@ def lookup(kind: str, name: str) -> Any:
     for ep in entry_points(group=ENTRY_POINT_GROUPS[kind]):
         if ep.name == name:
             return ep.load()
-    registry = {"feeder": FEEDERS, "packer": PACKERS, "hook": HOOKS}[kind]
+    registry = REGISTRIES[kind]
     if name not in registry:
         raise SubmissionError(f"Unknown {kind} plugin {name!r}")
     return registry[name]
@@ -187,6 +337,7 @@ class TransformationSpec:
     requirements_template: dict[str, Any]
     defaults: dict[str, Any]
     status_report: str | None
+    actions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 
 def compile_workgraph(path: Path) -> list[TransformationSpec]:
@@ -243,6 +394,7 @@ def compile_workgraph(path: Path) -> list[TransformationSpec]:
                 requirements_template=hint.get("requirements_template") or {},
                 defaults=defaults,
                 status_report=report,
+                actions=hint.get("actions") or {},
             )
         )
     return specs
@@ -295,6 +447,7 @@ class LocalCore:
     feeder_state: dict[str, Any] = field(default_factory=dict)
     feeder_enabled: bool = True
     parcels: list[Parcel] = field(default_factory=list)
+    finalizing: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Submission-time validation of every plugin binding
@@ -313,6 +466,19 @@ class LocalCore:
             if binding
             else None
         )
+        # Finalizing actions this harness provides; the others are reported
+        self.final_actions: list[tuple[str, Any, BaseModel | None]] = []
+        for entry in self.spec.actions.get("Finalizing") or []:
+            try:
+                fn = lookup("action", entry["action"])
+            except SubmissionError:
+                fn = None
+            args = validate_args("action", fn, entry.get("args") or {}) if fn else None
+            self.final_actions.append((entry["action"], fn, args))
+
+    def now(self) -> datetime:
+        clock = self.services.get(Clock)
+        return clock.now() if clock else datetime.now(timezone.utc)
 
     # -- inputs -------------------------------------------------------------
 
@@ -354,7 +520,7 @@ class LocalCore:
         return inserted
 
     def sweep_packer(self, *, flush: bool = False) -> list[Parcel]:
-        now = datetime.now(timezone.utc)
+        now = self.now()
         claimed = [
             r
             for r in self.rows.values()
@@ -486,6 +652,25 @@ class LocalCore:
             for child in decision.children:
                 self.insert(child, parent=row.id)
 
+    def waiting(self) -> bool:
+        """Whether some inputs are delayed, i.e. a later sweep has work to do."""
+        now = self.now()
+        return any(
+            r.status == "Unassigned" and r.delayed_until and r.delayed_until > now
+            for r in self.rows.values()
+        )
+
+    def finalize(self) -> list[dict[str, Any]]:
+        for name, fn, args in self.final_actions:
+            if fn is None:
+                self.finalizing.append({"action": name, "result": "Skipped"})
+                continue
+            result = call(fn, self.services, args=args)
+            self.finalizing.append(
+                {"action": name, "result": result.result, "message": result.message}
+            )
+        return self.finalizing
+
     def drained(self) -> bool:
         live = {"Unassigned", "Assigned", "Failed"}
         return not self.feeder_enabled and not any(
@@ -541,6 +726,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("workgraph", type=Path)
     parser.add_argument("--dbs", type=Path, help="JSON DBS dump {dataset: [files]}")
     parser.add_argument("--replicas", type=Path, help="JSON replica map {lfn: {...}}")
+    parser.add_argument("--rucio", type=Path, help="JSON for the mock Rucio")
+    parser.add_argument(
+        "--cycle-minutes", type=float, default=15, help="Simulated time per cycle"
+    )
     parser.add_argument("--outdir", type=Path, default=Path("out"))
     parser.add_argument(
         "--scouting", action="store_true", help="Run the scouting phase"
@@ -549,7 +738,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run", action="store_true", help="Run parcels with cwltool")
     parser.add_argument("--cwltool", default="cwltool --quiet --no-container")
     parser.add_argument("--max-jobs", type=int, default=10000, help="maxJobsPerTask")
-    parser.add_argument("--max-cycles", type=int, default=20)
+    parser.add_argument("--max-cycles", type=int, default=100)
     parser.add_argument(
         "--set",
         action="append",
@@ -560,9 +749,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     extra = {k: json.loads(v) for k, v in (item.split("=", 1) for item in args.set)}
 
-    services: dict[Any, Any] = {ReplicaCatalogue: JSONReplicas(args.replicas)}
+    clock = SimClock()
+    services: dict[Any, Any] = {
+        ReplicaCatalogue: JSONReplicas(args.replicas),
+        Clock: clock,
+    }
     if args.dbs:
         services[DBSClient] = JSONDBS(args.dbs)
+    if args.rucio:
+        services[RucioClient] = MockRucio(args.rucio, clock)
+        services[LockTable] = InMemoryLockTable()
 
     try:
         specs = compile_workgraph(args.workgraph)
@@ -575,6 +771,7 @@ def main(argv: list[str] | None = None) -> int:
 
     result = {}
     for core in cores:
+        cycles = 0
         for _ in range(args.max_cycles):
             core.sweep_feeder()
             new = core.sweep_packer(flush=args.flush)
@@ -585,12 +782,18 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            if not args.run:
+            if args.run:
+                for parcel in new:
+                    core.run_parcel(parcel, args.outdir, shlex.split(args.cwltool))
+            cycles += 1
+            waiting = core.waiting()
+            clock.advance(timedelta(minutes=args.cycle_minutes))
+            if waiting:
+                continue
+            if not args.run or core.drained() or not (new or core.feeder_enabled):
                 break
-            for parcel in new:
-                core.run_parcel(parcel, args.outdir, shlex.split(args.cwltool))
-            if core.drained() or not (new or core.feeder_enabled):
-                break
+        if core.drained():
+            core.finalize()
 
         stepdir = args.outdir / core.spec.step_id
         (stepdir / "parcels").mkdir(parents=True, exist_ok=True)
@@ -609,7 +812,15 @@ def main(argv: list[str] | None = None) -> int:
             "inputs": core.overview(),
             "parcels": dict(Counter(p.status for p in core.parcels)),
             "summary": summary,
+            "cycles": cycles,
         }
+        if core.finalizing:
+            result[core.spec.step_id]["finalizing"] = core.finalizing
+        if LockTable in services:
+            result[core.spec.step_id]["locks"] = {
+                lock.lfn: {"rse": lock.rse, "reroutes": lock.reroutes}
+                for lock in sorted(services[LockTable].all(), key=lambda x: x.lfn)
+            }
     print(json.dumps(result, indent=2, default=str))
     return 0
 

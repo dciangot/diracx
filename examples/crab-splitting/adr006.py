@@ -1,7 +1,7 @@
 """Local stand-ins for the Transformation System extension types of DX-ADR-006.
 
 DX-ADR-006 (DIRACGrid/diracx#1042) fixes the *shape* of what feeders, packers
-and hooks yield or return, and leaves the concrete Python API to
+and hooks yield or return (and actions return), and leaves the concrete Python API to
 implementation time. Until DiracX ships those types, the CRAB plugins in
 ``crab_plugins.py`` are written against the definitions below, which mirror the
 ADR one to one. Integrating the plugins into DiracX is then a matter of
@@ -127,3 +127,15 @@ class SplitInto:
 
 
 Decision = ToUnassigned | ToProblematic | SplitInto
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ActionResult:
+    result: Literal["Passed", "Failed", "Pending", "Done"]
+    message: str = ""
+    # per transformation, applied by the core when the action passes
+    updated_requirements: dict[UUID, JSONSerializable] = field(default_factory=dict)

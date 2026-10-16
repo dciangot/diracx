@@ -147,6 +147,8 @@ def feed(
     if job_type == "PrivateMC":
         if total_events <= 0:
             raise SplittingError("PrivateMC tasks require a positive number of events")
+        if events_per_lumi is not None and events_per_lumi <= 0:
+            raise SplittingError("events_per_lumi must be positive")
         return {
             "version": FEED_VERSION,
             "job_type": job_type,
@@ -372,8 +374,10 @@ def pack(
         events_per_job = int(units_per_job)
         if events_per_job <= 0:
             raise SplittingError("events_per_job must be positive")
-        total_events = int(total_units) or int(feed_doc["total_events"])
-        n_jobs = total_events // events_per_job
+        total_events = resolve_total(total_units, feed_doc["total_events"]) or int(
+            feed_doc["total_events"]
+        )
+        n_jobs = math.ceil(total_events / events_per_job)
         if n_jobs > max_jobs:
             raise SplittingError(
                 f"Your task would generate {n_jobs} jobs. "
@@ -393,6 +397,8 @@ def pack(
                 "Minimum runtime requirement for automatic splitting is "
                 f"{min_automatic_runtime} minutes."
             )
+        if num_probes <= 0:
+            raise SplittingError("num_probes must be positive")
         files_per_job = (len(files) + num_probes - 1) // num_probes
         jobs = _pack_file_based(files, max(files_per_job, 1), len(files))
     elif algorithm == "LumiBased":

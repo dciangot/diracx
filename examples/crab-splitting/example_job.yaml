@@ -1,0 +1,8 @@
+input_files:
+  class: File
+  path: example_input_files.json
+lumi_mask:
+  class: File
+  path: example_lumi_mask.json
+algorithm: LumiBased
+units_per_job: 3

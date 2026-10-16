@@ -253,6 +253,7 @@ nav:
     - Architecture Design Records:
       - adr/index.md
       - DX-ADR-001 - Tasks: adr/DX-ADR-001_tasks.md
+      - DX-ADR-010 - Rucio data management: adr/DX-ADR-010_rucio_data_management.md
 
 markdown_extensions:
   - admonition

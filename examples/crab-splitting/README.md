@@ -320,6 +320,9 @@ provides:
 
 ## Third example: register the outputs in Rucio, merge them and transfer them
 
+The second and third examples are specified as an ADR in
+[`docs/adr/DX-ADR-010_rucio_data_management.md`](../../docs/adr/DX-ADR-010_rucio_data_management.md).
+
 `crab-analysis-merge.cwl` keeps the analysis step of the second example and adds what CRAB does
 after a job ends: stage-out, publication of the files in Rucio, and ASO (asynchronous stage-out) to
 the user's storage site. It follows CRAB's Rucio ASO model:

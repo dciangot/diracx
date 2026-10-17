@@ -10,21 +10,21 @@
 
 ## Abstract
 
-This ADR fills the open issue "Rucio rules for workgraph outputs" left by DX-ADR-008 and extends it to the input side. It builds on the Transformation System ADRs DX-ADR-002 to DX-ADR-009 proposed in [DIRACGrid/diracx#1042](https://github.com/DIRACGrid/diracx/pull/1042), and changes none of them.
+This ADR fills the open issue "Rucio rules for workgraph outputs" left by DX-ADR-008 and extends it to the input side. It builds on the Transformation System ADRs DX-ADR-002 to DX-ADR-009 proposed in [DIRACGrid/diracx#1042](https://github.com/DIRACGrid/diracx/pull/1042), and changes none of their decisions; the few core additions it needs are listed in Open Issues.
 
 A workgraph running in a Rucio installation can ask for two things:
 
-- **Input locks.** Each Rucio Dataset is pinned with a Rucio rule at the storage element (RSE) of the site its job will run at, recalled from tape if need be (`dirac:RucioInputLocks`). No parcel is created until the rule is satisfied. This is done by a packer, which delays each input while its rule replicates.
-- **Output transfer.** Each output file is registered where the job wrote it. A final output is then moved to its destination by one rule, declared on the workgraph output with a new `dirac:RucioRule` hint field. An intermediate output is pinned where it is until its consumer has read it, for example a merge step that runs at the same site.
+- **Input rules.** Each input Rucio dataset is held by one Rucio rule at the storage element (RSE) of the site its jobs will run at, recalled from tape if need be. The rule is placed on a clone of the dataset that belongs to the transformation. It is declared on the workgraph input with a new `dirac:RucioInputRule` hint field. No parcel is created until its files are at the destination. This is done by a packer that wraps the community's own packer and delays each input while its file is on its way.
+- **Output transfer.** Each output file is registered where the job wrote it. A final output is then moved to its destination by one rule, declared on the workgraph output with a new `dirac:RucioRule` hint field. An intermediate output is registered where it was written and gets no rule; its consumer, for example a merge step, runs at the same site.
 
-Rucio stays what DX-ADR-008 says it is: a system of standing declarations, not a data backend. No parcel is ever made of a rule. DiracX creates rules, records them in an extension table, polls their state from packers and actions, and shortens their lifetime when it is done with them. Everything specific to Rucio lives in extension plugins and in the installation's catalogue implementation; the core gains a catalogue interface and nothing else.
+Rucio stays what DX-ADR-008 says it is: a system of standing declarations, not a data backend. No parcel is ever made of a rule. DiracX creates rules, records them in an extension table, polls their state from packers and actions, renews their lifetime from a hook while inputs still need them, and shortens it when it is done with them. Everything specific to Rucio lives in extension plugins and in the installation's catalogue implementation; the core gains a registration interface, the wrapping of a packer by an input hint, and a read-only view of live inputs (see Open Issues).
 
 ## Motivation
 
-DX-ADR-008 makes data management transformations RMS-driven and leaves Rucio to the communities: "declaring in the workgraph document that an output should carry a Rucio rule [...] is wanted by installations that use Rucio. Who creates the rule, who owns its lifetime, and what a workgraph's cleaning does to it are open." CMS needs an answer before can run on DiracX for non-MC workflows. CMS already uses Rucio on both sides of a job:
+DX-ADR-008 makes data management transformations RMS-driven and leaves Rucio to the communities: "declaring in the workgraph document that an output should carry a Rucio rule [...] is wanted by installations that use Rucio. Who creates the rule, who owns its lifetime, and what a workgraph's cleaning does to it are open." CMS needs an answer before it can run non-MC workflows on DiracX. CMS already uses Rucio on both sides of a job:
 
 - **Input.** When a dataset is only on tape, or not at a site the user may run at, CMS creates a Rucio rule. The task waits until the rule is `OK` and is only then split into jobs, which run where the data is. Processing on disk-resident data relies on Rucio having placed it at the job's site.
-- **Output.** job stages its output out to a local "temporary" area of the site it ran at. The file is then registered in Rucio under its final LFN, attached to the output dataset, and lets one rule on the container move everything to the user's storage site (`Site.storageSite`). Small outputs are merged first by dedicated merge step at the site.
+- **Output.** A job stages its output out to a local "temporary" area of the site it ran at. The file is then registered in Rucio under its final LFN and attached to the output dataset, and one rule on the container moves everything to the destination (the user's `Site.storageSite` in analysis). Small outputs are merged first by a dedicated merge step at the site.
 
 Neither fits the ADRs as they stand:
 
@@ -33,37 +33,37 @@ Neither fits the ADRs as they stand:
 - **Registration has no interface.** DX-ADR-003 has the core register outputs "into the installation's catalogue(s)" while a parcel is `Completing`, and DX-ADR-007 marks outputs that are not workgraph outputs as intermediate. Neither defines what a catalogue receives, so a Rucio catalogue cannot learn where a file is, whether it is intermediate, or where it should end up.
 - **The end of a task is not the end of its jobs.** A task is complete when its outputs are at the destination, not when its last job ends. DX-ADR-006 has `Pending` Finalizing actions, but nothing ties them to the data.
 
-A draft implementation of everything below, with a local stand-in for the core and a mock Rucio, is in `examples/crab-splitting/`: `crab_rucio.py` for the input side, `crab_outputs.py` for the output side, `crab-analysis-rucio.cwl` and `crab-analysis-merge.cwl` for the workgraphs.
+A draft implementation of everything below, with a local stand-in for the core and a mock Rucio, is in `examples/crab-splitting/`: `rucio_inputs.py` for the input side, `rucio_outputs.py` for the output side, `rucio_hooks.py` for the lifetime hook, `rucio_common.py` for the services and tables, and `rucio-input-rules.cwl` and `rucio-merge-transfer.cwl` for the workgraphs.
 
 ## Specification
 
 ### Principles
 
-1. **Rules are declarations, owned by the transformation that made them.** Every rule DiracX creates is recorded in the extension's `RucioRules` table against its transformation, with a kind (`InputDataset`, `IntermediatePin`, `Output`). Datasets on which the rule is placed are clones of the original dataset, named with a reference to the task name (allowing multiple worflows to pin the same dataset even when sharing the same rucio account). Lifetimes are what DiracX periodically checks and can extend through hooks if at least one file is requested by an unfinished job; deleting is reserved for cleaning.
+1. **Rules are declarations, owned by the transformation that made them.** Every rule DiracX creates is recorded in the extension's `RucioRules` table against its transformation, with a kind (`InputDataset` or `Output`). An input rule is placed on a clone of the input dataset, named after the transformation, so that several workflows can hold the same dataset even when they share a Rucio account. Lifetimes are what DiracX manages: a periodic hook extends a rule while at least one of its files is needed by an unfinished input, and an action shortens it at the end. Deleting is reserved for cleaning.
 2. **Nothing waits in a parcel.** The input side waits by delaying inputs (DX-ADR-005 `DelayedUntil`), so a parcel is created only once its data is in place. The output side waits in a `Pending` Finalizing action. No parcel ever sits in `Assigned` for a rule.
-3. **Every Rucio call can be repeated.** Plugins run as DX-ADR-001 tasks, which are retried, and `Completing` is re-entrant (DX-ADR-003). A rule is found again by its name (tanks to clone name ref to task in point 1.) before one is created, a DID by `get_did`, and a replica or attachment that already exists is not an error.
-4. **The core does not learn Rucio.** It calls a catalogue interface at `Completing` and passes on the hint fields it does not interpret. Choosing RSEs, creating rules and reading their state are the extension's.
+3. **Every Rucio call can be repeated.** Plugins run as DX-ADR-001 tasks, which are retried, and `Completing` is re-entrant (DX-ADR-003). A rule is found again by its DID (the clone's name refers to the transformation, principle 1), RSE expression and comment before one is created, a DID by `get_did`, and a replica or attachment that already exists is not an error.
+4. **The core does not learn Rucio.** It calls a registration interface at `Completing`, wraps a packer when an input carries `dirac:RucioInputRule`, and passes on the hint fields it does not interpret. Choosing RSEs, creating rules and reading their state are the extension's.
 
 ### Services
 
 The plugins receive their services by injection (DX-ADR-001, DX-ADR-006):
 
-| Service              | What it is                                                                                                                                                                                                                                                                                           |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `RucioClient`        | The subset of `rucio.client.Client` the plugins call: `list_replicas`, `list_did_rules`, `add_replication_rule`, `get_replication_rule`, `update_replication_rule`, and for registration `add_replicas`, `get_did`, `add_dataset`, `add_container`, `attach_dids`. A real client satisfies it as is. |
-| `RucioRules`         | The extension's table of rules, below.                                                                                                                                                                                                                                                               |
-| `RucioInputDatasets` | The extension's assignment table of DX-ADR-008 ("a destination is a decision with memory"), one row per locked dataset.                                                                                                                                                                              |
-| `OutputDestination`  | The installation's catalogue, called by the core at `Completing`. A Rucio installation registers `RucioOutputDestination`.                                                                                                                                                                           |
+| Service               | What it is                                                                                                                                                                                                                                                                                                                                                                        |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RucioClient`         | The subset of `rucio.client.Client` the plugins call: `list_replicas`, `list_parent_dids`, `list_files`, `list_content`, `list_did_rules`, `add_replication_rule`, `get_replication_rule`, `update_replication_rule`, `delete_replication_rule`, and for registration `add_replicas`, `get_did`, `add_dataset`, `add_container`, `attach_dids`. A real client satisfies it as is. |
+| `RucioTables`         | The extension's tables, below: `RucioRules`, `RucioInputDatasets` (the assignment table of DX-ADR-008, "a destination is a decision with memory", one row per held dataset) and `RucioOutputContainers`.                                                                                                                                                                          |
+| `LiveInputs`          | A read-only view, provided by the core, of the transformation's `Unassigned`, `Assigned` and `Failed` inputs, with the sites of the parcel of an `Assigned` one. The lifetime hook needs it.                                                                                                                                                                                      |
+| `OutputToDestination` | The installation's registration interface, called by the core at `Completing`. A Rucio installation registers `RucioOutputToDestination`.                                                                                                                                                                                                                                         |
 
-The client is built for the Rucio account that owns the workgraph's rules: the submitting user's account for user analysis, as in CRAB, or a production account. Which one is an installation policy (see Open Issues).
+The client is built for the Rucio account that owns the workgraph's rules: the submitting user's account for user analysis, or a production account. Which one is an installation policy.
 
 ```sql
 CREATE TABLE RucioRules (                          -- extension-owned
     TransformationID BIGINT       NOT NULL,
     RuleID           CHAR(32)     NOT NULL,        -- Rucio rule id
-    Kind             ENUM('InputLock', 'IntermediatePin', 'Output') NOT NULL,
+    Kind             ENUM('InputDataset', 'Output') NOT NULL,
     Scope            VARCHAR(64)  NOT NULL,
-    Name             VARCHAR(512) NOT NULL,        -- file, dataset or container
+    Name             VARCHAR(512) NOT NULL,        -- the clone, or the output container
     RSEExpression    VARCHAR(512) NOT NULL,
     CreatedAt        DATETIME     NOT NULL,
     ReleasedAt       DATETIME     NULL,            -- lifetime shortened
@@ -71,47 +71,88 @@ CREATE TABLE RucioRules (                          -- extension-owned
     FOREIGN KEY (TransformationID) REFERENCES Transformations (TransformationID)
 );
 
-CREATE TABLE RucioInputDatasets (                     -- extension-owned
+CREATE TABLE RucioInputDatasets (                  -- extension-owned
     TransformationID BIGINT       NOT NULL,
-    DatasetDID              VARCHAR(512) NOT NULL,
-    RSE              VARCHAR(64)  NOT NULL,
-    RuleID           CHAR(32)     NOT NULL,
+    Scope            VARCHAR(64)  NOT NULL,        -- the input dataset
+    Name             VARCHAR(512) NOT NULL,
+    CloneScope       VARCHAR(64)  NOT NULL,        -- the transformation's clone of it
+    CloneName        VARCHAR(512) NOT NULL,
+    RSE              VARCHAR(64)  NOT NULL,        -- the current destination
+    RuleID           CHAR(32)     NOT NULL,        -- the current rule on the clone
+    Files            INT          NOT NULL,        -- of the input dataset, for the thresholds
     Bytes            BIGINT       NOT NULL,
-    Since            DATETIME     NOT NULL,
+    Since            DATETIME     NOT NULL,        -- of the current rule
     Reroutes         INT          NOT NULL DEFAULT 0,
-    PRIMARY KEY (TransformationID, LFN),
+    Tried            JSON         NOT NULL,        -- the RSEs tried so far
+    PRIMARY KEY (TransformationID, Scope, Name),
+    FOREIGN KEY (TransformationID) REFERENCES Transformations (TransformationID)
+);
+
+CREATE TABLE RucioOutputContainers (               -- extension-owned
+    TransformationID BIGINT       NOT NULL,
+    Scope            VARCHAR(64)  NOT NULL,
+    Name             VARCHAR(512) NOT NULL,        -- the output container
+    Rule             JSON         NOT NULL,        -- its dirac:RucioRule
+    RuleID           CHAR(32)     NULL,            -- NULL until the rule is due
+    PRIMARY KEY (TransformationID, Scope, Name),
     FOREIGN KEY (TransformationID) REFERENCES Transformations (TransformationID)
 );
 ```
 
-### Input: lock, then pack
+### Input: hold each dataset, then pack
 
-A locking packer wraps a community's ordinary packer (e.g. for CMS input splitting). For each claimed `Unassigned` input it makes sure the input's file is locked at a destination, and passes the input on only once the lock is satisfied:
+#### `dirac:RucioInputRule`
 
-1. **Choose.** Pick a destination RSE (or a set of) once per dataset. Clone the dataset with a new DID containing reference to the transformation and record it in `RucioInputDatasets`. Candidates that satisfied the rules are grouped by RSE and filled in order up to a configurable threshold (e.g. number of files, sum of size). Question: may we need a `dirac:RucioInputRule` workgraph new input field (?) for that?
-2. **Lock.** Create a rule for the datasets at that selected RSE(s), with a lifetime and a `comment` unique to the transformation, or adopt the transformation's existing rule found by that comment. Record it in `RucioRules` as `InputLock`. A file only on tape is recalled by the lock itself; no separate recall step exists.
-3. **Monitor.** Read the files's state inside a rule:
-   - collect the replicas at the destination for each dataset. The input goes to the wrapped packer with that RSE's site as its only location, so the parcel's `requirements.sites` is where the data was locked.
-   - if not at destination yield `DelayInput` until `now + poll_minutes`.
-4. **Re-route or give up.** A `STUCK` rule, or one not `OK` after `max_wait_hours`, is released, and the file is locked at the next candidate (if any), up to `max_reroutes` times. After that the input is a `BadInput` and goes to `Problematic` for an operator (DX-ADR-005).
+A new field on a workgraph **input parameter**, next to its `dirac:Feeder`, added to the `dirac:` JSON schema (DX-ADR-007) and validated at submission:
 
-While any input is still on its way to a site, the packer holds back partial groups for that site as if its feeder were still active (DX-ADR-006), so a parcel is not cut short by a transfer about to finish. Locks are released by an action (below), not per parcel.
+```yaml
+inputs:
+  input-data:
+    dirac:Feeder:
+      name: CRABDBS
+      args: {dataset: /Muon/Run2024A-PromptReco-v1/MINIAOD}
+    dirac:RucioInputRule:
+      destinations: [T2_IT_Legnaro, T2_IT_Pisa, T1_IT_CNAF_Disk]
+      clone_scope: user.alice
+      max_bytes_per_rse: 50000000000000
+```
 
-The packer's arguments, validated at submission by its model (DX-ADR-006):
+| Field                                    | Default          | Meaning                                                                                |
+| ---------------------------------------- | ---------------- | -------------------------------------------------------------------------------------- |
+| `destinations`                           | required         | Candidate disk RSEs, in order of preference (the user's site whitelist in CMS)         |
+| `scope`                                  | `cms`            | Scope of the input files and datasets                                                  |
+| `clone_scope`                            | `scope`          | Scope the clones are created in, e.g. the user's scope                                 |
+| `activity`                               | `Analysis Input` | FTS activity of the rules                                                              |
+| `max_files_per_rse`, `max_bytes_per_rse` | none             | Thresholds: how much of its input the transformation may hold at one RSE               |
+| `lifetime_days`                          | 14               | Lifetime of a new rule; the lifetime hook extends it while needed                      |
+| `poll_minutes`                           | 15               | Delay of an input whose file is not at its destination yet                             |
+| `max_wait_hours`, `max_reroutes`         | 48, 1            | When a rule is given up, and how many other RSEs are tried                             |
+| `release_grace_hours`                    | 24               | Lifetime left to a rule released by a re-route, for parcels already running at its RSE |
 
-| Argument                         | Meaning                                                           | CRAB equivalent                 |
-| -------------------------------- | ----------------------------------------------------------------- | ------------------------------- |
-| `destinations`                   | Candidate disk RSEs, in order of preference                       | `Site.whitelist`                |
-| `destination_quota_bytes`        | Bytes this transformation may lock per RSE                        | Rucio quota of the lock account |
-| `scope`, `activity`              | DID scope of the input, FTS activity of the rule                  | `cms`, `Analysis Input`         |
-| `comment`                        | Identifies this transformation's rules; unique per transformation | the task name                   |
-| `lock_lifetime_days`             | Lifetime of a lock while the transformation runs                  | rule lifetime                   |
-| `poll_minutes`                   | Delay between two reads of a replicating rule                     | TaskWorker's recall polling     |
-| `max_wait_hours`, `max_reroutes` | When a rule is given up, and how many other RSEs are tried        | —                               |
+The hint sits on the input, not in the packer's arguments, because it describes the data rather than the grouping: any community packer can be used with it. A step whose driving input carries the hint has its packer resolved, at submission, to `RucioInputRules` with the hint as its arguments, and the step's own packer, bound to its own arguments and services, is passed to it as an injected `InnerPacker`. `RucioInputRules` replaces the replica view of the inner packer, so that a file is only at the site where it is held.
+
+#### What `RucioInputRules` does with each claimed input
+
+1. **Dataset.** Find the Rucio dataset (the CMS block) the file belongs to, with `list_parent_dids`. A file in no dataset is a `BadInput`.
+2. **Choose, once per dataset.** Pick the destination RSE among `destinations`: the first one that already holds every file of the dataset, where the rule is only a pin; otherwise the first one under the thresholds, counting what the transformation already holds there. Record the choice in `RucioInputDatasets`.
+3. **Clone and rule.** Create the dataset `<dataset>__dx-<transformation name>` in `clone_scope`, and an `InputDataset` rule on it at the chosen RSE, with `lifetime_days`. Attach each file to the clone when it is first claimed: a rule on an open dataset covers the files attached after it was created, so the clone holds what the transformation is fed and nothing more. A file only on tape is recalled by the rule itself; no separate recall step exists.
+4. **Monitor, file by file.** Read the replicas of the claimed files at their destinations, in one call:
+    - a file at its destination goes to the wrapped packer with that RSE's site as its only location, so the parcel's `requirements.sites` is where the data is;
+    - any other file yields `DelayInput` until `now + poll_minutes`. While a file is on its way to a site, the wrapped packer is called for that site as if its feeder were still active (DX-ADR-006), so a partial parcel is not cut short by a transfer about to finish.
+5. **Re-route or give up.** A `STUCK` rule, or one not done after `max_wait_hours`, is released (its lifetime shortened to `release_grace_hours`), and a new rule is created on the same clone at the next candidate, up to `max_reroutes` times. After that the dataset's waiting inputs are `BadInput` and go to `Problematic` for an operator (DX-ADR-005).
 
 This is the DX-ADR-008 pattern "the consumer's packer waits on the replica", with the packer also creating the replica.
 
-### Output: register, pin or transfer
+#### Lifetimes: the `RucioRuleKeeper` hook
+
+DX-ADR-006 runs a transformation's `Active` hook periodically while the transformation is `Active`. `RucioRuleKeeper` is bound there (`renew_before_hours`, default 72; `extend_days`, default 14) and proposes no operation. Each run, it extends to `extend_days` from now every `InputDataset` rule of the transformation that expires within `renew_before_hours` and is still needed:
+
+- the dataset's current rule, while a file of its clone is `Unassigned`, `Assigned` or `Failed`;
+- any rule, including one released by a re-route, while a file of its clone is `Assigned` to a parcel that runs at the rule's site.
+
+A rule that nothing needs any more is left to expire. Releasing per transformation (below) remains the end of the story; the hook makes sure a long transformation does not lose its data before then. The same hook creates the output rules that wait for a completion threshold (below).
+
+### Output: register, then transfer
 
 #### Registration at `Completing`
 
@@ -120,6 +161,7 @@ The core registers a parcel's outputs at `Completing` (DX-ADR-003) through the i
 ```python
 @dataclass(frozen=True)
 class ProducedFile:
+    transformation_id: int
     workgraph: str
     step: str
     output: str  # the output port
@@ -129,7 +171,7 @@ class ProducedFile:
     bytes: int
     adler32: str
     intermediate: bool  # DX-ADR-007 TransformationOutputs.Intermediate
-    hints: dict[str, JSONSerializable]  # the dirac: fields of the workgraph output
+    hints: dict[str, JSONSerializable]  # the dirac: fields of the workgraph output, without the prefix
 
 
 class OutputToDestination(Protocol):
@@ -137,17 +179,15 @@ class OutputToDestination(Protocol):
         """Register one parcel's files and return their LFNs, in order. Idempotent."""
 ```
 
-TODO: introduce a mechanism to add output rules only upon a certain threshold of workflows completion.
-
 The returned LFNs are what the core writes as `ParcelOutputs` rows, so the catalogue owns the LFN policy. A parcel that fails registers nothing, as in DX-ADR-003. A catalogue that raises leaves the parcel in `Completing`, and the core calls it again.
 
 `RucioOutputToDestination` does the following for each file, at the RSE the file was locally written to (the site's temporary area in CMS):
 
 1. Compute the LFN. A workgraph output goes under the user or production area, e.g. `/store/user/<account>/<workgraph>/<step>/<output>/<basename>`. An intermediate goes under the temporary area, e.g. `/store/temp/user/...`. The per-parcel output prefix injected at scheduling (DX-ADR-007) makes basenames unique.
 2. Call `add_replicas` at the RSE, with size and checksum.
-3. Attach the file to the CMS dataset, creating the dataset and attaching it to the container on first use.
-4. For an intermediate, register the DID in the temporary RSE only.
-5. For a workgraph output with a `dirac:RucioRule`, create the `Output` rule on the container, once. Files registered later are attached to the same container and are covered by the same rule.
+3. Attach the file to a dataset of its container, one per RSE (`<container>#<rse>`), creating the dataset and attaching it to the container on first use.
+4. For an intermediate, stop there: it is registered at the temporary RSE only and gets no rule.
+5. For a workgraph output with a `dirac:RucioRule`, record the container in `RucioOutputContainers`, and create the `Output` rule on it, once, if `min_completion` is 0. Files registered later are attached to the same container and are covered by the same rule.
 
 #### `dirac:RucioRule`
 
@@ -163,6 +203,7 @@ outputs:
       container: /Muon/alice-Run2024A-v1/USER
       lifetime_days: 180
       activity: User Subscriptions
+      min_completion: 0.5
 ```
 
 | Field            | Required | Meaning                                                                    |
@@ -172,8 +213,11 @@ outputs:
 | `lifetime_days`  | no       | Lifetime of the rule; none by default                                      |
 | `activity`       | no       | FTS activity; installation default                                         |
 | `copies`         | no       | Number of copies; 1 by default                                             |
+| `min_completion` | no       | Fraction of the step's inputs that must be `Processed` first; 0 by default |
 
-The hint sits on the workgraph output, not on a step, because an output is what a workgraph promises to deliver. A step output that is not a workgraph output is intermediate (DX-ADR-007) and is never transferred, only pinned.
+`min_completion` delays the rule, so that a transfer is not started for a handful of files of a workflow that may still be killed. The fraction is only meaningful once all inputs are known, so it is evaluated by the `RucioRuleKeeper` hook once the step's feeder is off (DX-ADR-006): from then on, the rule is created as soon as `Processed / (all inputs)` reaches it. `WaitForRucioTransfers` creates it at the latest, so every output is transferred.
+
+The hint sits on the workgraph output, not on a step, because an output is what a workgraph promises to deliver. A step output that is not a workgraph output is intermediate (DX-ADR-007) and is never transferred: it stays at the RSE it was written to.
 
 #### Merging is a transformation
 
@@ -181,13 +225,13 @@ Merging is an ordinary compute step, edge-fed from the producer's outputs (DX-AD
 
 - it reads each input's replicas from Rucio and groups inputs by RSE, never across RSEs;
 - it sends the merge parcel to that RSE's site, so the unmerged files are read locally and only merged files travel;
-- it cuts a group at a minimum size, a maximum size or a maximum file count (`ParentlessMergeBySize`), and packs the remainder once the producer has drained and its feeder is off;
+- it cuts a group at a minimum size, a maximum size or a maximum file count (`RucioMergeBySize`), and packs the remainder once the producer has drained and its feeder is off;
 - an input with no replica is a `BadInput`.
 
 ```mermaid
 flowchart LR
-    In[(input dataset)] -. "locking packer:<br/>rule to the job's site" .-> A[analysis]
-    A -- "intermediate:<br/>registered at Temp, pinned" --> M[merge<br/>same site]
+    In[(input dataset)] -. "dirac:RucioInputRule:<br/>rule on a clone, to the job's site" .-> A[analysis]
+    A -- "intermediate:<br/>registered at Temp, no rule" --> M[merge<br/>same site]
     M -- "workgraph output:<br/>registered at Temp" --> C[(output container)]
     C -. "dirac:RucioRule" .-> D[(destination RSE)]
 ```
@@ -198,24 +242,40 @@ Without a merge step, `dirac:RucioRule` goes on an output sourced directly from 
 
 The rules are tied to the transformation lifecycle (DX-ADR-005) through actions (DX-ADR-006). Because members finalise upstream first, a consumer's actions run after its producer is `Finalized`.
 
-| List         | Action                   | Result                                                                                                                                               |
-| ------------ | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Finalizing` | `ReleaseRucioInputRules` | `Done`: shortens every `InputRule` rule of the transformation to a grace period and sets `ReleasedAt`.                                               |
-| `Finalizing` | `WaitForRucioTransfers`  | `Pending` while an `Output` rule replicates; `Failed` on `STUCK`, which moves the transformation to `FinalizingBlocked`; `Passed` once all are `OK`. |
-| `Cleaning`   | `RemoveRucioRules`       | `Done`: deletes every rule of the transformation, including `Output` rules, so the outputs are removed as cleaning requires.                         |
+| List / hook  | Action                   | Result                                                                                                                                                                                    |
+| ------------ | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Active`     | `RucioRuleKeeper`        | Hook, no operation: extends the `InputDataset` rules still needed and creates the `Output` rules whose `min_completion` is reached.                                                       |
+| `Finalizing` | `ReleaseRucioInputRules` | `Done`: shortens every `InputDataset` rule of the transformation to a grace period and sets `ReleasedAt`.                                                                                 |
+| `Finalizing` | `WaitForRucioTransfers`  | Creates any `Output` rule still due; `Pending` while an `Output` rule replicates; `Failed` on `STUCK`, which moves the transformation to `FinalizingBlocked`; `Passed` once all are `OK`. |
+| `Cleaning`   | `RemoveRucioRules`       | `Done`: deletes every rule of the transformation, including `Output` rules, so the outputs are removed as cleaning requires.                                                              |
 
-`WaitForRucioTransfers` makes a workgraph `Completed` mean "the data is at its destination", which means completed task. An operator who accepts an incomplete transfer forces the action to passed, as for any failed action.
+`WaitForRucioTransfers` makes a workgraph `Completed` mean "the data is at its destination". An operator who accepts an incomplete transfer forces the action to passed, as for any failed action.
 
-In the example in `examples/crab-splitting/` these actions are `CRABReleaseInputLocks`, `CRABWaitForTransfers` and `CRABReleaseIntermediates`. It releases intermediates at `Finalizing`, for brevity in a single run; this ADR places it in `Archiving`, where DX-ADR-006 removes intermediates.
+The example in `examples/crab-splitting/` uses these names: `rucio-input-rules.cwl` binds the hook and the input actions, `rucio-merge-transfer.cwl` the hook and the output actions.
 
 ### Accounting
 
-Rule bytes stay outside the DX-ADR-009 counters, as DX-ADR-008 states. A locking packer budgets from `RucioInputLocks`; the authoritative limit is the Rucio account's quota at each RSE, which Rucio enforces when a rule is created. A rule refused for quota is handled as a `STUCK` rule: re-routed, then `BadInput`.
+Rule bytes stay outside the DX-ADR-009 counters, as DX-ADR-008 states. `RucioInputRules` budgets from `RucioInputDatasets`; the authoritative limit is the Rucio account's quota at each RSE, which Rucio enforces when a rule is created. A rule refused for quota is handled as a `STUCK` rule: re-routed, then `BadInput`.
+
+## Rationale
+
+- **One rule per dataset, on a clone.** Rucio and CMS transfer by dataset (block), and a rule per file would cost one rule and one status call per file. The clone holds only what the transformation was fed, so a rule never moves files nobody asked for, and its name ties the rule to one transformation, so two workflows of one account never share a lifetime.
+- **A hint, not packer arguments.** Holding data is a property of the input, not of the grouping: with `dirac:RucioInputRule` any community packer gets Rucio input handling without knowing Rucio, and the workgraph says what it needs in the place DX-ADR-007 validates.
+- **Lifetimes renewed by a hook.** A rule created with a finite lifetime can never be leaked, but a long transformation would lose its data. The `Active` hook is the only periodic, per-transformation place DX-ADR-006 offers, and renewing only what is still needed lets everything else expire on its own.
+
+## Rejected Ideas
+
+- **A rule per file.** Simpler bookkeeping, but one rule and one poll per file, and no dataset-level transfer.
+- **A rule on the original dataset.** It would move the whole dataset even when the transformation reads part of it, and Rucio allows one rule per account, DID and RSE, so two workflows of one account would share it.
+- **A rule with no lifetime, deleted at the end.** A transformation that is never finalised would hold the data forever.
+- **Rucio as a data backend, or a staging transformation upstream.** Rejected by DX-ADR-008; data transformations are sinks and cannot feed the compute step.
 
 ## Open Issues
 
-- **Side effects in a packer.** DX-ADR-006 says plugins propose and the core writes; creating a rule is an external write. It is repeatable here, and the tables are the extension's, but DX-ADR-006 could name "external reservations made by a packer" explicitly, or provide a hook that runs before packing. (needed as input dataset rule creation)
-- **Release per parcel.** Locks and pins are released per transformation. Releasing a file as soon as its inputs are `Processed`, or its consumer's parcel is `Done`, needs a hook on input or parcel completion that DX-ADR-006 does not define.
+- **Side effects in a packer and a hook.** DX-ADR-006 says plugins propose and the core writes; creating, extending or releasing a rule is an external write, made here by `RucioInputRules` and `RucioRuleKeeper`. It is repeatable, and the tables are the extension's, but DX-ADR-006 could name "external reservations made by a plugin" explicitly.
+- **Core support.** Three things are asked of the core: wrapping a step's packer when its input carries `dirac:RucioInputRule`, with the inner packer injected; passing `feeder_enabled` to the `Active` hook; and the read-only `LiveInputs` service. None is in DX-ADR-006 today.
+- **Release per parcel.** Input rules are released per transformation, and kept alive meanwhile by the hook. Releasing a dataset as soon as its inputs are `Processed` would need a hook on input or parcel completion that DX-ADR-006 does not define; the hook's "left to expire" is the approximation.
+- **Rules per clone.** Several transformations reading the same dataset create several clones and rules, so Rucio may hold the same files twice at an RSE under different rules. That is the price of independent lifetimes; sharing a rule would need reference counting across transformations.
 - **Upload location.** `ProducedFile.location` must come from the job wrapper's report of where each file was uploaded (DX-ADR-007 abandoned uploads), not from the parcel's requirements.
 - **Stuck output transfers.** `WaitForRucioTransfers` blocks the transformation on a `STUCK` rule. Whether it should first try another RSE expression, and who decides, is open.
 - **Schema.** `dirac:RucioRule` must be added to the published `dirac:` JSON schema (DX-ADR-007), with its defaults resolved through the configuration service like other hint fields. Same for a RUCIO input rule hint if it will be needed.

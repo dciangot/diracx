@@ -5,13 +5,12 @@
 # Same document as crab-analysis.cwl, plus a dirac:RucioInputRule next to the
 # dirac:Feeder of the driving input. The core then runs the step's packer
 # (CRABSplitter here; any packer works) inside RucioInputRules, which:
-#   - attaches each input dataset (CMS block) to a clone of its container,
-#     named after the transformation and the destination, which carries one
-#     rule at that destination: the first one that already holds the block,
-#     or else the first one under the per-RSE thresholds;
-#   - passes a dataset's files on only once the whole dataset is at the
-#     destination, so a parcel runs where its data is; delays them otherwise;
-#   - moves a dataset whose rule is STUCK or too slow to the next destination.
+#   - puts one rule per input dataset (CMS block), on a clone of the dataset
+#     named after the transformation, at the first destination that already
+#     holds the block, or else the first one under the per-RSE thresholds;
+#   - passes a file on only once it is at the destination, so a parcel runs
+#     where its data is; delays it otherwise;
+#   - re-routes a STUCK or too slow rule to the next destination.
 # The RucioRuleKeeper Active hook renews the rules while inputs need them;
 # ReleaseRucioInputRules lets them expire at Finalizing.
 cwlVersion: v1.2
@@ -21,7 +20,7 @@ label: CMS analysis with Rucio input rules
 doc: |-
   Run cmsRun over a DBS dataset, filtered by a lumi mask, in jobs of a fixed
   number of lumis; every input block is held by a Rucio rule at the site its
-  jobs run at, and a job is only created once its block is there.
+  jobs run at, and a job is only created once its files are there.
 
 $namespaces:
   dirac: https://diracgrid.org/cwl#

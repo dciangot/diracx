@@ -35,7 +35,7 @@ describes what each job runs, and it can still be run unchanged by a stock `cwlt
 | `rucio-input-rules.cwl`                         | Workgraph: CMS analysis whose input blocks are held by Rucio rules at the jobs' sites                                                                            |
 | `rucio-merge-transfer.cwl`                      | Workgraph: the same analysis → merge by size where the outputs are → Rucio rule to the storage site                                                              |
 | `transformations/merge.cwl`                     | The process each merge parcel runs: a mock EDM merge                                                                                                             |
-| `example_rucio.json`                            | RSEs, replicas, input blocks and container for the mock Rucio of `local_core.py --rucio`                                                                         |
+| `example_rucio.json`                            | RSEs, replicas and input blocks for the mock Rucio of `local_core.py --rucio`                                                                                    |
 | `test_rucio_inputs.py`, `test_rucio_outputs.py` | Tests of the Rucio plugins                                                                                                                                       |
 
 ## Mapping CRAB to the Transformation System
@@ -205,7 +205,7 @@ DiracX core provides only the generic machinery the ADRs define.
 Rucio for its inputs and its outputs. The plugins in `rucio_*.py` implement it; nothing in them is
 CRAB-specific, so they serve CMS analysis and production alike, and wrap any community packer.
 
-### Input: one rule per cloned container, the original datasets attached
+### Input: one rule per dataset, on a clone
 
 A driving input that carries `dirac:RucioInputRule` next to its `dirac:Feeder` has its step's packer
 (`CRABSplitter` here) wrapped in `RucioInputRules`, with the hint as arguments:
@@ -222,37 +222,35 @@ inputs:
 
 ```mermaid
 flowchart TD
-    I[claimed input] --> D[its Rucio dataset and container<br/>list_parent_dids]
-    D --> P{dataset held for this<br/>transformation?}
-    P -- no --> C[choose an RSE: already holds the dataset,<br/>else first under the thresholds]
-    C --> K[container__dx-transformation__RSE<br/>+ one rule on it at the RSE<br/>+ attach the original dataset]
-    K --> Q
-    P -- yes --> Q{dataset AVAILABLE at the RSE?<br/>list_dataset_replicas}
-    Q -- yes --> W[wrapped packer, with the RSE's site<br/>as the files' only location]
+    I[claimed input] --> D[its Rucio dataset<br/>list_parent_dids]
+    D --> P{held for this<br/>transformation?}
+    P -- no --> C[choose an RSE: already holds the block,<br/>else first under the thresholds]
+    C --> K[clone dataset__dx-transformation<br/>+ rule on the clone]
+    K --> A
+    P -- yes --> A[attach the file to the clone]
+    A --> Q{replica at the RSE?}
+    Q -- yes --> W[wrapped packer, with the RSE's site<br/>as the file's only location]
     Q -- no --> S{rule STUCK or<br/>older than max_wait_hours?}
     S -- no --> DL[DelayInput poll_minutes]
     S -- yes --> RR{reroutes left?}
-    RR -- yes --> N[detach the dataset, attach it to the<br/>clone of the next RSE] --> DL
+    RR -- yes --> N[release the rule, new rule on the<br/>same clone at the next RSE] --> DL
     RR -- no --> B[BadInput]
 ```
 
-- The rule is on a **cloned container** per input container and destination RSE, named after the
-    transformation (`<container>__dx-<transformation>__<RSE>`), with the **original datasets** (CMS
-    blocks) attached to it: one rule to create, renew and poll per destination, covering every
-    dataset sent there. Two workgraphs, even of the same Rucio account, never share a rule; a retried
-    task finds the clone by its name and the rule by its DID, RSE and comment.
-- Readiness is **per dataset**: one `list_dataset_replicas` call per dataset, and its inputs are
-    packed only once the whole dataset is `AVAILABLE` at the destination.
-- A re-route moves the dataset between clones (`detach_dids`, `attach_dids`); the old rule keeps the
-    other datasets of its clone, and an empty clone's rule is left to expire.
-- The `RucioRuleKeeper` **`Active` hook** renews a rule's lifetime while a file of a dataset of its
-    clone is still needed by an unfinished input. `ReleaseRucioInputRules` shortens them at
-    `Finalizing`, and `RemoveRucioRules` deletes every rule of the transformation at `Cleaning`.
+- A rule per **dataset** (CMS block), not per file: one rule to create, renew and poll per block.
+- The rule is on a **clone** named after the transformation, holding only the files the
+    transformation is fed. Two workgraphs, even of the same Rucio account, never share a rule; a
+    retried task finds the clone by its name and the rule by its DID, RSE and comment.
+- Readiness is **per file**: a file at the destination is packed while the rest of its block is still
+    on its way, but a partial group for that site is held back until the transfers to it end.
+- The `RucioRuleKeeper` **`Active` hook** renews a rule's lifetime while a file of its clone is still
+    needed by an unfinished input. `ReleaseRucioInputRules` shortens them at `Finalizing`, and
+    `RemoveRucioRules` deletes every rule of the transformation at `Cleaning`.
 
 `rucio-input-rules.cwl` on `example_rucio.json`: block A (`f1`, `f2`) is at `T2_IT_Legnaro` and is only
 pinned there, so its parcels are created at once. Block B (`f3` on tape, `f4` at DESY) no longer
-fits Legnaro's 2 MB threshold, goes to the `T2_IT_Pisa` clone, whose rule ends `STUCK` after the
-recall, and is moved to the `T1_IT_CNAF_Disk` clone; its parcels run there once both files arrived.
+fits Legnaro's 2 MB threshold, goes to `T2_IT_Pisa`, whose rule ends `STUCK` after the recall, and is
+re-routed to `T1_IT_CNAF_Disk`; its parcels run there.
 
 ### Output: register where written, merge there, one rule to the destination
 
@@ -266,7 +264,7 @@ A workgraph output with `dirac:RucioRule` gets one rule on its container, at onc
 
 ```mermaid
 flowchart LR
-    In[(input blocks)] -. "RucioInputRules:<br/>rule on a cloned container, at the job's site" .-> A[analysis]
+    In[(input blocks)] -. "RucioInputRules:<br/>rule on a clone, at the job's site" .-> A[analysis]
     A -- "intermediate:<br/>registered at Temp, no rule" --> M[merge<br/>same site]
     M -- "workgraph output:<br/>registered at Temp" --> C[(output container)]
     C -. "dirac:RucioRule<br/>(min_completion)" .-> D[(destination RSE)]

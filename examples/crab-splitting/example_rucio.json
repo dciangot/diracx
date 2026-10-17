@@ -15,5 +15,17 @@
     "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f2.root": {"bytes": 800000, "rses": ["T2_IT_Legnaro"]},
     "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f3.root": {"bytes": 600000, "rses": ["T1_IT_CNAF_Tape"]},
     "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f4.root": {"bytes": 200000, "rses": ["T2_DE_DESY"]}
+  },
+  "datasets": {
+    "cms": {
+      "/Muon/Run2024A-PromptReco-v1/MINIAOD#blockA": [
+        "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f1.root",
+        "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f2.root"
+      ],
+      "/Muon/Run2024A-PromptReco-v1/MINIAOD#blockB": [
+        "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f3.root",
+        "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f4.root"
+      ]
+    }
   }
 }

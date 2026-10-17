@@ -107,6 +107,29 @@ class DelayInput:
 PackerYield = ComputeParcel | BadInput | DelayInput
 
 # ---------------------------------------------------------------------------
+# Hooks: the entity they are called with, and the operation they return
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Transformation:
+    """The part of a ``Transformations`` row (DX-ADR-004) a plugin is shown."""
+
+    id: int
+    name: str
+    workgraph: str | None = None
+    feeder_enabled: bool = True
+
+
+@dataclass(frozen=True)
+class Operation:
+    feeder_args: dict[str, JSONSerializable] | None = None
+    feeder_enabled: bool | None = None
+    pause: bool = False
+    flush: bool = False
+
+
+# ---------------------------------------------------------------------------
 # HandleFailedInput decisions
 # ---------------------------------------------------------------------------
 

@@ -20,30 +20,37 @@ end on a laptop:
    status report (DX-ADR-007) and apply it, calling ``HandleFailedInput``
    for failures (DX-ADR-005).
 5. **Completing** (DX-ADR-003/007): register the outputs of a successful
-   parcel through the catalogue (``crab_outputs.RucioOutputCatalogue`` with
-   ``--rucio``, an LFN policy otherwise) and record them in ``ParcelOutputs``,
-   which the core's edge feeder feeds to the steps that consume them.
-6. **Finalizing** (DX-ADR-006): once the transformation has drained, run the
+   parcel through the installation's ``OutputToDestination``
+   (``rucio_outputs.RucioOutputToDestination`` with ``--rucio``, an LFN
+   policy otherwise) and record them in ``ParcelOutputs``, which the core's
+   edge feeder feeds to the steps that consume them.
+6. **Active hook** (DX-ADR-006): call the transformation's ``Active`` hook
+   once per cycle while it has not drained.
+7. **Finalizing** (DX-ADR-006): once the transformation has drained, run the
    ``Finalizing`` actions this harness knows about, calling a ``Pending`` one
    again on later cycles; the others are reported as skipped.
+
+A driving input carrying ``dirac:RucioInputRule`` (DX-ADR-010) wraps the
+step's packer in ``rucio_inputs.RucioInputRules``, with the hint as its
+arguments and the step's own packer as its injected ``InnerPacker``.
 
 Every transformation of the workgraph is swept in each cycle, in document
 order, so that a consumer sees in the same cycle what its producer registered.
 
 Time is simulated: each cycle advances a clock by ``--cycle-minutes``, and
 cycles continue while inputs are delayed (``DelayInput``), so that a packer
-waiting on a transfer (``crab_rucio.py``) runs to completion in seconds.
+waiting on a transfer (``rucio_inputs.py``) runs to completion in seconds.
 
 Plugins are looked up through entry points first (the integration plan's
-groups below) and then in the ``crab_plugins`` registries.
+groups below) and then in the registries of the example's modules.
 
 Usage::
 
     python3 local_core.py crab-analysis.cwl --dbs example_dbs.json \\
         --replicas example_replicas.json --outdir out [--scouting] [--run]
-    python3 local_core.py crab-analysis-rucio.cwl --dbs example_dbs.json \\
+    python3 local_core.py rucio-input-rules.cwl --dbs example_dbs.json \\
         --rucio example_rucio.json --outdir out [--run]
-    python3 local_core.py crab-analysis-merge.cwl --dbs example_dbs.json \\
+    python3 local_core.py rucio-merge-transfer.cwl --dbs example_dbs.json \\
         --rucio example_rucio.json --outdir out --run
 """
 
@@ -61,7 +68,7 @@ import uuid
 import zlib
 from collections import Counter
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -81,15 +88,7 @@ from adr006 import (
     SplitInto,
     ToProblematic,
     ToUnassigned,
-)
-from crab_outputs import ACTIONS as OUTPUT_ACTIONS
-from crab_outputs import PACKERS as OUTPUT_PACKERS
-from crab_outputs import (
-    OutputCatalogue,
-    ProducedFile,
-    RucioOutputCatalogue,
-    RucioOutputClient,
-    RucioRuleHint,
+    Transformation,
 )
 from crab_plugins import (
     FEEDERS,
@@ -98,9 +97,27 @@ from crab_plugins import (
     DBSClient,
     ReplicaCatalogue,
 )
-from crab_rucio import ACTIONS, Clock, InputLock, LockTable, RucioClient
-from crab_rucio import PACKERS as RUCIO_PACKERS
 from pydantic import BaseModel, ConfigDict, ValidationError
+from rucio_common import (
+    Clock,
+    InMemoryRucioTables,
+    LiveInput,
+    LiveInputs,
+    RucioClient,
+    RucioTables,
+)
+from rucio_hooks import HOOKS as RUCIO_HOOKS
+from rucio_inputs import ACTIONS as INPUT_ACTIONS
+from rucio_inputs import PACKERS as INPUT_PACKERS
+from rucio_inputs import InnerPacker, Locations, RucioInputRule
+from rucio_outputs import ACTIONS as OUTPUT_ACTIONS
+from rucio_outputs import PACKERS as OUTPUT_PACKERS
+from rucio_outputs import (
+    OutputToDestination,
+    ProducedFile,
+    RucioOutputToDestination,
+    RucioRuleHint,
+)
 
 ENTRY_POINT_GROUPS = {
     "feeder": "diracx.transformations.feeders",
@@ -161,26 +178,11 @@ class SimClock:
         self.t += delta
 
 
-class InMemoryLockTable:
-    """The extension's lock table (a database table in production)."""
-
-    def __init__(self) -> None:
-        self._locks: dict[str, InputLock] = {}
-
-    def get(self, lfn: str) -> InputLock | None:
-        return self._locks.get(lfn)
-
-    def put(self, lock: InputLock) -> None:
-        self._locks[lock.lfn] = lock
-
-    def all(self) -> list[InputLock]:
-        return list(self._locks.values())
-
-
 class MockRucio:
     """Enough of ``rucio.client.Client`` to watch rules progress in simulated time.
 
-    The JSON file holds ``{"rses": {rse: {...}}, "replicas": {lfn: {...}}}``.
+    The JSON file holds ``{"rses": {rse: {...}}, "replicas": {lfn: {...}},
+    "datasets": {scope: {dataset: [lfn, ...]}}}``.
     A rule covers a file, or every file of a dataset or container (including
     files attached after the rule was made). A file already at the rule's RSE
     is satisfied at once; otherwise it arrives after the destination's
@@ -198,6 +200,13 @@ class MockRucio:
         self.rules: dict[str, dict[str, Any]] = {}
         # dataset and container name -> attached DID names
         self.collections: dict[str, dict[str, Any]] = {}
+        for scope, datasets in data.get("datasets", {}).items():
+            for name, lfns in datasets.items():
+                self.collections[name] = {
+                    "scope": scope,
+                    "type": "DATASET",
+                    "children": list(lfns),
+                }
 
     def _files(self, name: str) -> list[str]:
         if name not in self.collections:
@@ -242,6 +251,8 @@ class MockRucio:
         return rule
 
     def list_replicas(self, dids: list[dict[str, str]]) -> list[dict[str, Any]]:
+        for rule in self.rules.values():
+            self._refresh(rule)  # what has arrived by now
         return [
             {
                 "scope": did["scope"],
@@ -251,6 +262,19 @@ class MockRucio:
             }
             for did in dids
             if did["name"] in self.replicas
+        ]
+
+    def list_parent_dids(self, scope: str, name: str) -> list[dict[str, Any]]:
+        return [
+            {"scope": c["scope"], "name": parent, "type": c["type"]}
+            for parent, c in self.collections.items()
+            if name in c["children"]
+        ]
+
+    def list_files(self, scope: str, name: str) -> list[dict[str, Any]]:
+        return [
+            {"scope": scope, "name": f, "bytes": self.replicas[f]["bytes"]}
+            for f in self._files(name)
         ]
 
     def list_did_rules(self, scope: str, name: str) -> list[dict[str, Any]]:
@@ -302,7 +326,11 @@ class MockRucio:
             )
         return True
 
-    # -- registration (crab_outputs.py) -------------------------------------
+    def delete_replication_rule(self, rule_id: str) -> bool:
+        del self.rules[rule_id]
+        return True
+
+    # -- registration (rucio_outputs.py) ------------------------------------
 
     def add_replicas(self, rse: str, files: list[dict[str, Any]]) -> bool:
         if rse not in self.rses:
@@ -345,6 +373,8 @@ class MockRucio:
             self.get_did(did["scope"], did["name"])
             if did["name"] not in children:
                 children.append(did["name"])
+        for rule in self.rules.values():
+            self._refresh(rule)  # rules on open collections cover new files
         return True
 
     def list_content(self, scope: str, name: str) -> list[dict[str, str]]:
@@ -422,7 +452,7 @@ def edge_feeder(
 
 
 class LocalCatalogue:
-    """The catalogue when there is no Rucio: an LFN policy and nothing else."""
+    """``OutputToDestination`` when there is no Rucio: an LFN policy and nothing else."""
 
     def register(self, files: list[ProducedFile]) -> list[str]:
         return [
@@ -433,9 +463,9 @@ class LocalCatalogue:
 
 REGISTRIES: dict[str, dict[str, Any]] = {
     "feeder": {**FEEDERS, "Edge": edge_feeder},
-    "packer": {**PACKERS, **RUCIO_PACKERS, **OUTPUT_PACKERS},
-    "hook": HOOKS,
-    "action": {**ACTIONS, **OUTPUT_ACTIONS},
+    "packer": {**PACKERS, **INPUT_PACKERS, **OUTPUT_PACKERS},
+    "hook": {**HOOKS, **RUCIO_HOOKS},
+    "action": {**INPUT_ACTIONS, **OUTPUT_ACTIONS},
 }
 
 # ---------------------------------------------------------------------------
@@ -517,8 +547,10 @@ class TransformationSpec:
     status_report: str | None
     actions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     workgraph: str = "workgraph"
-    # data output port -> (intermediate, dirac:RucioRule or None)
-    outputs: dict[str, tuple[bool, dict[str, Any] | None]] = field(default_factory=dict)
+    # data output port -> (intermediate, dirac: fields of the workgraph output)
+    outputs: dict[str, tuple[bool, dict[str, Any]]] = field(default_factory=dict)
+    # dirac:RucioInputRule of the driving input, if any (DX-ADR-010)
+    input_rule: dict[str, Any] | None = None
 
 
 def compile_workgraph(path: Path) -> list[TransformationSpec]:
@@ -526,19 +558,15 @@ def compile_workgraph(path: Path) -> list[TransformationSpec]:
     if doc.get("class") != "Workflow" or f"{DIRAC}Workgraph" not in _hints(doc):
         raise SubmissionError("A workgraph is a Workflow carrying dirac:Workgraph")
     wf_inputs = _by_id(doc.get("inputs"))
-    declared: dict[str, dict[str, Any] | None] = {}
+    declared: dict[str, dict[str, Any]] = {}
     for out_id, out in _by_id(doc.get("outputs")).items():
         rule = out.get(f"{DIRAC}RucioRule")
         if rule is not None:
-            try:
-                RucioRuleHint.model_validate(rule)
-            except ValidationError as exc:
-                raise SubmissionError(
-                    f"Invalid dirac:RucioRule on {out_id}: {exc}"
-                ) from exc
+            _validate_hint(RucioRuleHint, rule, f"dirac:RucioRule on {out_id}")
+        fields = {k[len(DIRAC) :]: v for k, v in out.items() if k.startswith(DIRAC)}
         source = out.get("outputSource")
         for src in source if isinstance(source, list) else [source]:
-            declared[src] = rule
+            declared[src] = fields
     specs = []
     for step_id, step in _by_id(doc.get("steps")).items():
         hint = _hints(step).get(f"{DIRAC}Transformation")
@@ -556,11 +584,17 @@ def compile_workgraph(path: Path) -> list[TransformationSpec]:
         if driving is None or driving not in fed:
             raise SubmissionError(f"Step {step_id!r} has no unambiguous driving input")
         feeder: dict[str, Any]
+        input_rule = None
         if "/" in sources[driving]:
             # Fed by another step's output: the core's edge feeder (DX-ADR-006)
             feeder = {"name": "Edge", "args": {"source": sources[driving]}}
         else:
             feeder = wf_inputs[sources[driving]][f"{DIRAC}Feeder"]
+            input_rule = wf_inputs[sources[driving]].get(f"{DIRAC}RucioInputRule")
+            if input_rule is not None:
+                _validate_hint(
+                    RucioInputRule, input_rule, f"dirac:RucioInputRule on {driving}"
+                )
         defaults = {
             k: wf_inputs[s]["default"]
             for k, s in sources.items()
@@ -579,7 +613,7 @@ def compile_workgraph(path: Path) -> list[TransformationSpec]:
         packer = hint.get("packer") or {"name": "CRABSplitter", "args": {}}
         outs = [o if isinstance(o, str) else o["id"] for o in step.get("out") or []]
         data_outputs = {
-            o: (f"{step_id}/{o}" not in declared, declared.get(f"{step_id}/{o}"))
+            o: (f"{step_id}/{o}" not in declared, declared.get(f"{step_id}/{o}", {}))
             for o in outs
             if o != report
         }
@@ -599,9 +633,17 @@ def compile_workgraph(path: Path) -> list[TransformationSpec]:
                 actions=hint.get("actions") or {},
                 workgraph=str(doc.get("id") or path.stem).lstrip("#"),
                 outputs=data_outputs,
+                input_rule=input_rule,
             )
         )
     return specs
+
+
+def _validate_hint(model: type[BaseModel], value: Any, where: str) -> None:
+    try:
+        model.model_validate(value)
+    except ValidationError as exc:
+        raise SubmissionError(f"Invalid {where}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +688,7 @@ class LocalCore:
     spec: TransformationSpec
     services: dict[Any, Any]
     scouting: bool = False
+    transformation_id: int = 1
     rows: dict[UUID, Row] = field(default_factory=dict)
     hashes: set[bytes] = field(default_factory=set)
     feeder_state: dict[str, Any] = field(default_factory=dict)
@@ -657,6 +700,17 @@ class LocalCore:
     lfns: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self.transformation = Transformation(
+            self.transformation_id,
+            f"{self.spec.workgraph}-{self.spec.step_id}",
+            self.spec.workgraph,
+        )
+        # What the core provides to this transformation's plugins
+        self.services = {
+            **self.services,
+            Transformation: self.transformation,
+            LiveInputs: self,
+        }
         # Submission-time validation of every plugin binding
         self.feeder_fn = lookup("feeder", self.spec.feeder)
         self.feeder_args = validate_args(
@@ -666,13 +720,15 @@ class LocalCore:
         self.packer_args = validate_args(
             "packer", self.packer_fn, self.spec.packer_args
         )
-        binding = self.spec.hooks.get("HandleFailedInput")
-        self.failed_fn = lookup("hook", binding["hook"]) if binding else None
-        self.failed_args = (
-            validate_args("hook", self.failed_fn, binding.get("args") or {})
-            if binding
-            else None
-        )
+        if self.spec.input_rule is not None:
+            # DX-ADR-010: the step's packer runs inside RucioInputRules
+            self.services[InnerPacker] = self._inner(self.packer_fn, self.packer_args)
+            self.packer_fn = lookup("packer", "RucioInputRules")
+            self.packer_args = validate_args(
+                "packer", self.packer_fn, self.spec.input_rule
+            )
+        self.failed_fn, self.failed_args = self._hook("HandleFailedInput")
+        self.active_fn, self.active_args = self._hook("Active")
         # Finalizing actions this harness provides; the others are reported
         self.final_actions: list[tuple[str, Any, BaseModel | None]] = []
         for entry in self.spec.actions.get("Finalizing") or []:
@@ -683,9 +739,73 @@ class LocalCore:
             args = validate_args("action", fn, entry.get("args") or {}) if fn else None
             self.final_actions.append((entry["action"], fn, args))
 
+    def _hook(self, name: str) -> tuple[Any, BaseModel | None]:
+        binding = self.spec.hooks.get(name)
+        if not binding:
+            return None, None
+        fn = lookup("hook", binding["hook"])
+        return fn, validate_args("hook", fn, binding.get("args") or {})
+
+    def _inner(self, fn: Any, args: BaseModel) -> InnerPacker:
+        def inner(
+            *,
+            inputs: Any,
+            flush: bool,
+            feeder_active: bool,
+            input_overview: dict[str, int],
+            replicas: Locations,
+        ) -> Any:
+            return call(
+                fn,
+                {**self.services, ReplicaCatalogue: replicas},
+                packer_args=args,
+                inputs=inputs,
+                flush=flush,
+                feeder_active=feeder_active,
+                input_overview=input_overview,
+            )
+
+        return typing.cast(InnerPacker, inner)
+
     def now(self) -> datetime:
         clock = self.services.get(Clock)
         return clock.now() if clock else datetime.now(timezone.utc)
+
+    def live(self) -> list[LiveInput]:
+        """``LiveInputs`` (DX-ADR-010): the inputs not over yet, and their sites."""
+        parcels = {p.id: p for p in self.parcels}
+        return [
+            LiveInput(
+                r.lfn,
+                typing.cast(Any, r.status),
+                tuple(
+                    (parcels[r.parcel].requirements or {}).get("sites") or ()
+                    if r.parcel and r.status == "Assigned"
+                    else ()
+                ),
+            )
+            for r in self.rows.values()
+            if r.status in {"Unassigned", "Assigned", "Failed"}
+        ]
+
+    def active(self) -> None:
+        """Call the transformation's ``Active`` hook and apply its operation."""
+        if self.active_fn is None:
+            return
+        op = call(
+            self.active_fn,
+            self.services,
+            transformation=replace(
+                self.transformation, feeder_enabled=self.feeder_enabled
+            ),
+            input_overview=self.overview(),
+            args=self.active_args,
+        )
+        if op is not None:
+            if op.feeder_enabled is not None:
+                self.feeder_enabled = op.feeder_enabled
+            if op.flush:
+                self.sweep_packer(flush=True)
 
     # -- inputs -------------------------------------------------------------
 
@@ -806,25 +926,28 @@ class LocalCore:
     def complete(self, parcel: Parcel, outputs: dict[str, Any]) -> None:
         produced = []
         sites = (parcel.requirements or {}).get("sites") or ["LOCAL"]
-        for port, (intermediate, rule) in self.spec.outputs.items():
+        for port, (intermediate, hints) in self.spec.outputs.items():
             value = outputs.get(port) or []
             for f in value if isinstance(value, list) else [value]:
                 data = Path(f["path"]).read_bytes()
                 produced.append(
                     ProducedFile(
+                        transformation_id=self.transformation.id,
                         workgraph=self.spec.workgraph,
                         step=self.spec.step_id,
                         output=port,
                         parcel_id=parcel.id,
-                        site=str(sites[0]),
+                        # Open issue in DX-ADR-010: the upload location belongs
+                        # in the job's report; the parcel's site stands in here
+                        location=str(sites[0]),
                         basename=f["basename"],
                         bytes=len(data),
                         adler32=f"{zlib.adler32(data):08x}",
                         intermediate=intermediate,
-                        rule=rule,
+                        hints=hints,
                     )
                 )
-        catalogue = self.services.get(OutputCatalogue) or LocalCatalogue()
+        catalogue = self.services.get(OutputToDestination) or LocalCatalogue()
         lfns = catalogue.register(produced)
         table = self.services.get(ParcelOutputs)
         for f, lfn in zip(produced, lfns, strict=True):
@@ -1000,7 +1123,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-jobs", type=int, default=10000, help="maxJobsPerTask")
     parser.add_argument("--max-cycles", type=int, default=100)
     parser.add_argument(
-        "--account", default="crabuser", help="Rucio account owning the outputs"
+        "--account", default="cmsuser", help="Rucio account owning the rules"
     )
     parser.add_argument(
         "--set",
@@ -1021,19 +1144,29 @@ def main(argv: list[str] | None = None) -> int:
     }
     if args.dbs:
         services[DBSClient] = JSONDBS(args.dbs)
-    catalogue: RucioOutputCatalogue | None = None
+    tables = InMemoryRucioTables()
+    rucio: MockRucio | None = None
     if args.rucio:
         rucio = MockRucio(args.rucio, clock)
-        catalogue = RucioOutputCatalogue(rucio, account=args.account)
-        services[RucioClient] = services[RucioOutputClient] = rucio
-        services[LockTable] = InMemoryLockTable()
-        services[OutputCatalogue] = services[RucioOutputCatalogue] = catalogue
+        services[RucioClient] = rucio
+        services[RucioTables] = tables
+        services[OutputToDestination] = RucioOutputToDestination(
+            rucio,
+            tables,
+            clock,
+            scope=f"user.{args.account}",
+            lfn_base=f"/store/user/{args.account}",
+            temp_lfn_base=f"/store/temp/user/{args.account}",
+        )
 
     try:
         specs = compile_workgraph(args.workgraph)
         for spec in specs:
             spec.defaults.update(extra)
-        cores = [LocalCore(spec, services, scouting=args.scouting) for spec in specs]
+        cores = [
+            LocalCore(spec, services, scouting=args.scouting, transformation_id=n)
+            for n, spec in enumerate(specs, 1)
+        ]
     except SubmissionError as exc:
         print(f"Submission refused: {exc}", file=sys.stderr)
         return 2
@@ -1058,7 +1191,9 @@ def main(argv: list[str] | None = None) -> int:
                 for parcel in new:
                     core.run_parcel(parcel, args.outdir, cwltool)
             table.drained[core.spec.step_id] = core.drained()
-            if core.drained() and not core.finalized:
+            if not core.drained():
+                core.active()
+            elif not core.finalized:
                 core.finalized = core.finalize()
                 busy |= not core.finalized
             waiting |= core.waiting()
@@ -1095,23 +1230,27 @@ def main(argv: list[str] | None = None) -> int:
             result[core.spec.step_id]["outputs"] = core.lfns
         if core.finalizing:
             result[core.spec.step_id]["finalizing"] = core.finalizing
-        if LockTable in typing.get_type_hints(core.packer_fn).values():
-            result[core.spec.step_id]["locks"] = {
-                lock.lfn: {"rse": lock.rse, "reroutes": lock.reroutes}
-                for lock in sorted(services[LockTable].all(), key=lambda x: x.lfn)
+        datasets = tables.datasets(core.transformation.id)
+        if datasets:
+            result[core.spec.step_id]["input_datasets"] = {
+                d.dataset: {"clone": d.clone, "rse": d.rse, "reroutes": d.reroutes}
+                for d in sorted(datasets, key=lambda x: x.dataset)
             }
-    if catalogue is not None and catalogue.rules:
-        rules = {}
-        for rule_id, (kind, name) in sorted(
-            catalogue.rules.items(), key=lambda x: x[1]
-        ):
-            rule = catalogue.rucio.get_replication_rule(rule_id)
-            rules[name] = {
-                "kind": kind,
-                "rse_expression": rule["rse_expression"],
-                "state": rule["state"],
-                "expires_at": rule.get("expires_at"),
-            }
+    if rucio is not None and tables.all_rules():
+        rules = []
+        for row in sorted(tables.all_rules(), key=lambda r: (r.created_at, r.name)):
+            rule = rucio.get_replication_rule(row.rule_id)
+            rules.append(
+                {
+                    "transformation": row.transformation_id,
+                    "kind": row.kind,
+                    "name": row.name,
+                    "rse_expression": row.rse_expression,
+                    "state": rule["state"],
+                    "expires_at": rule.get("expires_at"),
+                    "released": row.released_at is not None,
+                }
+            )
         result["rucio_rules"] = rules
     print(json.dumps(result, indent=2, default=str))
     return 0

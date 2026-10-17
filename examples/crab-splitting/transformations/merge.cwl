@@ -1,5 +1,5 @@
 #!/usr/bin/env cwl-runner
-# The process run by every parcel of the CRABMerge transformation: a stand-in
+# The process run by every parcel of the RucioMergeBySize transformation: a stand-in
 # for the EDM merge job (cmsRun with a merge PSet) of WMCore's merge tasks.
 cwlVersion: v1.2
 class: CommandLineTool

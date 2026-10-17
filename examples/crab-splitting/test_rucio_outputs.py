@@ -1,8 +1,8 @@
-"""Tests for output registration in Rucio, the merge packer and the transfer actions.
+"""Tests for output registration in Rucio, the merge packer, the rules and the actions.
 
 Run from this directory, outside the repository's pytest configuration::
 
-    python3 -m pytest -c /dev/null -p no:cacheprovider test_crab_outputs.py
+    python3 -m pytest -c /dev/null -p no:cacheprovider test_rucio_outputs.py
 """
 
 from __future__ import annotations
@@ -22,16 +22,7 @@ from adr006 import (
     NoMoreInputs,
     PackerInput,
     SetFeederState,
-)
-from crab_outputs import (
-    CRABMergeArgs,
-    CRABReleaseIntermediatesArgs,
-    CRABWaitForTransfersArgs,
-    ProducedFile,
-    RucioOutputCatalogue,
-    crab_merge_packer,
-    crab_release_intermediates,
-    crab_wait_for_transfers,
+    Transformation,
 )
 from local_core import (
     EdgeFeederArgs,
@@ -44,9 +35,22 @@ from local_core import (
     main,
 )
 from pydantic import ValidationError
+from rucio_common import InMemoryRucioTables
+from rucio_hooks import RucioRuleKeeperArgs, rucio_rule_keeper_hook
+from rucio_outputs import (
+    ProducedFile,
+    RemoveRucioRulesArgs,
+    RucioMergeBySizeArgs,
+    RucioOutputToDestination,
+    WaitForRucioTransfersArgs,
+    remove_rucio_rules,
+    rucio_merge_by_size_packer,
+    wait_for_rucio_transfers,
+)
 
 HERE = Path(__file__).parent
-CONTAINER = "/Muon/crabuser-Run2024A-test/USER"
+CONTAINER = "/Muon/cmsuser-Run2024A-test/USER"
+T = Transformation(2, "wg-merge", "wg")
 
 
 class World:
@@ -57,27 +61,58 @@ class World:
         path.write_text(json.dumps(data))
         self.clock = SimClock()
         self.rucio = MockRucio(path, self.clock)
-        self.catalogue = RucioOutputCatalogue(self.rucio, account="crabuser")
+        self.tables = InMemoryRucioTables()
+        self.catalogue = self.registrar()
+
+    def registrar(self) -> RucioOutputToDestination:
+        return RucioOutputToDestination(
+            self.rucio,
+            self.tables,
+            self.clock,
+            scope="user.cmsuser",
+            lfn_base="/store/user/cmsuser",
+            temp_lfn_base="/store/temp/user/cmsuser",
+        )
 
     def produced(self, n, *, site="T2_IT_Legnaro", intermediate=True, rule=None):
         return ProducedFile(
+            transformation_id=T.id if not intermediate else 1,
             workgraph="wg",
             step="merge" if not intermediate else "analysis",
             output="out",
             parcel_id=n,
-            site=site,
+            location=site,
             basename=f"out_{n}.root",
             bytes=100,
             adler32="0000beef",
             intermediate=intermediate,
-            rule=rule,
+            hints={"RucioRule": rule} if rule else {},
         )
 
     def wait(self, **kwargs):
-        return crab_wait_for_transfers(
-            args=CRABWaitForTransfersArgs(**kwargs),
+        return wait_for_rucio_transfers(
+            args=WaitForRucioTransfersArgs(**kwargs),
             rucio=self.rucio,
-            catalogue=self.catalogue,
+            tables=self.tables,
+            clock=self.clock,
+            transformation=T,
+        )
+
+    def keeper(self, overview, feeder_enabled=False):
+        class NoLive:
+            def live(self):
+                return []
+
+        return rucio_rule_keeper_hook(
+            transformation=Transformation(
+                T.id, T.name, T.workgraph, feeder_enabled=feeder_enabled
+            ),
+            input_overview=overview,
+            args=RucioRuleKeeperArgs(),
+            rucio=self.rucio,
+            tables=self.tables,
+            live=NoLive(),
+            clock=self.clock,
         )
 
 
@@ -86,55 +121,49 @@ def world(tmp_path):
     return World(tmp_path)
 
 
-def _rule(rse="T2_DE_DESY"):
-    return {"rse_expression": rse, "container": CONTAINER}
+def _rule(rse="T2_DE_DESY", **kwargs):
+    return {"rse_expression": rse, "container": CONTAINER, **kwargs}
 
 
 # -- registration ------------------------------------------------------------
 
 
-def test_intermediate_is_registered_at_temp_and_pinned(world):
+def test_intermediate_is_registered_at_temp_without_a_rule(world):
     [lfn] = world.catalogue.register([world.produced(1)])
-    assert lfn == "/store/temp/user/crabuser/wg/analysis/out/out_1.root"
+    assert lfn == "/store/temp/user/cmsuser/wg/analysis/out/out_1.root"
     assert world.rucio.replicas[lfn]["rses"] == ["T2_IT_Legnaro_Temp"]
     assert world.rucio.replicas[lfn]["adler32"] == "0000beef"
-    dataset = "/wg/crabuser-analysis-out/UNMERGED#T2_IT_Legnaro_Temp"
+    dataset = "/wg/analysis-out/UNMERGED#T2_IT_Legnaro_Temp"
     assert world.rucio.collections[dataset]["children"] == [lfn]
-    assert world.rucio.collections["/wg/crabuser-analysis-out/UNMERGED"][
-        "children"
-    ] == [dataset]
-    [(rule_id, (kind, name))] = world.catalogue.rules.items()
-    assert (kind, name) == ("intermediate", dataset)
-    rule = world.rucio.get_replication_rule(rule_id)
-    assert rule["rse_expression"] == "T2_IT_Legnaro_Temp"
-    assert rule["state"] == "OK"
-    assert rule["expires_at"] == world.clock.now() + timedelta(days=7)
+    assert world.rucio.collections["/wg/analysis-out/UNMERGED"]["children"] == [dataset]
+    assert world.rucio.rules == {}
+    assert world.tables.all_rules() == []
 
 
 def test_registration_is_idempotent(world):
-    files = [world.produced(1), world.produced(2)]
+    files = [world.produced(1), world.produced(2, intermediate=False, rule=_rule())]
     world.catalogue.register(files)
     # The core retries Completing, possibly from a fresh process
-    again = RucioOutputCatalogue(world.rucio, account="crabuser")
-    again.register(files)
+    world.registrar().register(files)
     assert len(world.rucio.rules) == 1
-    assert again.rules.keys() == world.catalogue.rules.keys()
-    dataset = "/wg/crabuser-analysis-out/UNMERGED#T2_IT_Legnaro_Temp"
-    assert len(world.rucio.collections[dataset]["children"]) == 2
+    assert len(world.tables.rules(T.id)) == 1
+    dataset = "/wg/analysis-out/UNMERGED#T2_IT_Legnaro_Temp"
+    assert len(world.rucio.collections[dataset]["children"]) == 1
 
 
 def test_output_rule_moves_the_container_to_the_destination(world):
     first = world.catalogue.register(
         [world.produced(1, intermediate=False, rule=_rule())]
     )
-    assert first == ["/store/user/crabuser/wg/merge/out/out_1.root"]
+    assert first == ["/store/user/cmsuser/wg/merge/out/out_1.root"]
     assert world.wait().result == "Pending"
     world.clock.advance(timedelta(minutes=20))
     # a file registered later, at another site, is covered by the same rule
     second = world.catalogue.register(
         [world.produced(2, site="T1_IT_CNAF", intermediate=False, rule=_rule())]
     )
-    assert [k for k, _ in world.catalogue.rules.values()] == ["final"]
+    [rule] = world.tables.rules(T.id)
+    assert (rule.kind, rule.name) == ("Output", CONTAINER)
     world.clock.advance(timedelta(minutes=15))
     assert world.wait().result == "Pending"  # the second file is still on its way
     world.clock.advance(timedelta(minutes=15))
@@ -143,6 +172,30 @@ def test_output_rule_moves_the_container_to_the_destination(world):
     assert result.message == "Output transfer: 1 OK"
     for lfn in first + second:
         assert "T2_DE_DESY" in world.rucio.replicas[lfn]["rses"]
+
+
+def test_output_rule_waits_for_min_completion(world):
+    world.catalogue.register(
+        [world.produced(1, intermediate=False, rule=_rule(min_completion=0.5))]
+    )
+    [row] = world.tables.outputs(T.id)
+    assert row.rule_id is None and world.rucio.rules == {}
+    world.keeper({"Processed": 3, "Assigned": 1}, feeder_enabled=True)
+    assert world.rucio.rules == {}  # not every input is known yet
+    world.keeper({"Processed": 1, "Assigned": 3})
+    assert world.rucio.rules == {}  # 25% < 50%
+    world.keeper({"Processed": 2, "Assigned": 2})
+    [row] = world.tables.outputs(T.id)
+    assert row.rule_id in world.rucio.rules
+
+
+def test_wait_creates_a_rule_still_pending(world):
+    world.catalogue.register(
+        [world.produced(1, intermediate=False, rule=_rule(min_completion=1))]
+    )
+    assert world.wait().result == "Pending"
+    [row] = world.tables.outputs(T.id)
+    assert row.rule_id in world.rucio.rules
 
 
 def test_stuck_output_rule_fails_finalizing(world):
@@ -154,22 +207,17 @@ def test_stuck_output_rule_fails_finalizing(world):
     assert world.wait(fail_on_stuck=False).result == "Passed"
 
 
-def test_release_intermediates_shortens_only_the_pins(world):
-    world.catalogue.register(
-        [world.produced(1), world.produced(2, intermediate=False, rule=_rule())]
-    )
-    result = crab_release_intermediates(
-        args=CRABReleaseIntermediatesArgs(grace_hours=1),
+def test_remove_rules_deletes_every_rule(world):
+    world.catalogue.register([world.produced(1, intermediate=False, rule=_rule())])
+    result = remove_rucio_rules(
+        args=RemoveRucioRulesArgs(),
         rucio=world.rucio,
-        catalogue=world.catalogue,
+        tables=world.tables,
+        transformation=T,
     )
-    assert result.result == "Done"
-    for rule_id, (kind, _) in world.catalogue.rules.items():
-        expires = world.rucio.rules[rule_id]["expires_at"]
-        if kind == "intermediate":
-            assert expires == world.clock.now() + timedelta(hours=1)
-        else:
-            assert expires is None
+    assert (result.result, result.message) == ("Done", "1 rules deleted")
+    assert world.rucio.rules == {}
+    assert world.tables.rules(T.id) == []
 
 
 # -- merge packer ------------------------------------------------------------
@@ -178,8 +226,8 @@ def test_release_intermediates_shortens_only_the_pins(world):
 def _merge(world, inputs, feeder_active=False, **kwargs):
     args = {"min_merge_size": 250, "max_merge_size": 300, **kwargs}
     return list(
-        crab_merge_packer(
-            packer_args=CRABMergeArgs(**args),
+        rucio_merge_by_size_packer(
+            packer_args=RucioMergeBySizeArgs(**args),
             inputs=iter(inputs),
             feeder_active=feeder_active,
             input_overview={},
@@ -232,7 +280,7 @@ def test_merge_input_without_replica_is_bad(world):
 
 def test_merge_args_are_checked():
     with pytest.raises(ValidationError):
-        CRABMergeArgs(min_merge_size=10, max_merge_size=5)
+        RucioMergeBySizeArgs(min_merge_size=10, max_merge_size=5)
 
 
 # -- core side: edge feeder and workgraph compilation --------------------------
@@ -265,19 +313,21 @@ def test_edge_feeder_bookmarks_and_waits_for_the_producer():
 
 
 def test_compile_merge_workgraph():
-    analysis, merge = compile_workgraph(HERE / "crab-analysis-merge.cwl")
+    analysis, merge = compile_workgraph(HERE / "rucio-merge-transfer.cwl")
     assert analysis.feeder == "CRABDBS"
-    assert analysis.outputs == {"output-files": (True, None)}
+    assert analysis.outputs == {"output-files": (True, {})}
+    assert analysis.input_rule is not None
     assert merge.feeder == "Edge"
     assert merge.feeder_args == {"source": "analysis/output-files"}
-    assert merge.packer == "CRABMerge"
-    intermediate, rule = merge.outputs["merged"]
+    assert merge.packer == "RucioMergeBySize"
+    assert merge.input_rule is None
+    intermediate, hints = merge.outputs["merged"]
     assert not intermediate
-    assert rule["rse_expression"] == "T2_DE_DESY"
+    assert hints["RucioRule"]["rse_expression"] == "T2_DE_DESY"
 
 
 def test_invalid_rucio_rule_is_refused(tmp_path):
-    doc = yaml.safe_load((HERE / "crab-analysis-merge.cwl").read_text())
+    doc = yaml.safe_load((HERE / "rucio-merge-transfer.cwl").read_text())
     doc["outputs"]["merged"]["dirac:RucioRule"] = {"rse": "T2_DE_DESY"}
     path = tmp_path / "bad.cwl"
     path.write_text(yaml.safe_dump(doc))
@@ -312,31 +362,34 @@ def _run(tmp_path, capsys, workgraph):
 
 @needs_cwltool
 def test_end_to_end_merge_and_transfer(tmp_path, capsys):
-    result = _run(tmp_path, capsys, HERE / "crab-analysis-merge.cwl")
+    result = _run(tmp_path, capsys, HERE / "rucio-merge-transfer.cwl")
     analysis, merge = result["analysis"], result["merge"]
     assert analysis["parcels"] == {"Done": 5}
     assert all(lfn.startswith("/store/temp/user/") for lfn in analysis["outputs"])
+    assert [a["result"] for a in analysis["finalizing"]] == ["Skipped", "Done"]
     assert merge["inputs"] == {"Processed": 5}
-    assert merge["parcels"] == {"Done": 3}
-    assert len(merge["outputs"]) == 3
-    assert [a["result"] for a in merge["finalizing"]] == ["Passed", "Done"]
+    assert set(merge["parcels"]) == {"Done"}
+    assert all(lfn.startswith("/store/user/") for lfn in merge["outputs"])
+    assert [a["result"] for a in merge["finalizing"]] == ["Passed"]
     rules = result["rucio_rules"]
-    final = rules["/Muon/crabuser-Run2024A-crab_analysis_merge/USER"]
-    assert (final["kind"], final["state"]) == ("final", "OK")
-    assert sorted(k for k, r in rules.items() if r["kind"] == "intermediate") == [
-        "/crab_analysis_merge/crabuser-analysis-output-files/UNMERGED#T1_IT_CNAF_Temp",
-        "/crab_analysis_merge/crabuser-analysis-output-files/UNMERGED#T2_IT_Legnaro_Temp",
-    ]
+    [output] = [r for r in rules if r["kind"] == "Output"]
+    assert output["name"] == "/Muon/cmsuser-Run2024A-rucio_merge_transfer/USER"
+    assert (output["rse_expression"], output["state"]) == ("T2_DE_DESY", "OK")
+    # no rule on intermediates; every input rule released at Finalizing
+    inputs = [r for r in rules if r["kind"] == "InputDataset"]
+    assert len(inputs) == len(rules) - 1 == 3
+    assert all(r["released"] for r in inputs)
 
 
 @needs_cwltool
 def test_end_to_end_transfer_without_merge(tmp_path, capsys):
-    doc = yaml.safe_load((HERE / "crab-analysis-merge.cwl").read_text())
+    doc = yaml.safe_load((HERE / "rucio-merge-transfer.cwl").read_text())
     rule = doc["outputs"].pop("merged")["dirac:RucioRule"]
+    del rule["min_completion"]
     del doc["steps"]["merge"]
     doc["steps"]["analysis"]["hints"]["dirac:Transformation"]["actions"][
         "Finalizing"
-    ].insert(0, {"action": "CRABWaitForTransfers"})
+    ].insert(0, {"action": "WaitForRucioTransfers"})
     doc["outputs"]["output-files"] = {
         "type": "File[]",
         "outputSource": "analysis/output-files",
@@ -349,5 +402,5 @@ def test_end_to_end_transfer_without_merge(tmp_path, capsys):
     analysis = result["analysis"]
     assert all(lfn.startswith("/store/user/") for lfn in analysis["outputs"])
     assert analysis["finalizing"][0]["result"] == "Passed"
-    [(name, rule)] = result["rucio_rules"].items()
-    assert (rule["kind"], rule["state"]) == ("final", "OK")
+    [output] = [r for r in result["rucio_rules"] if r["kind"] == "Output"]
+    assert output["state"] == "OK"

@@ -222,14 +222,14 @@ inputs:
 
 ```mermaid
 flowchart TD
-    I[claimed input] --> D[its Rucio dataset<br/>list_parent_dids]
+    I[claimed input] --> D[its Rucio dataset and container<br/>list_parent_dids]
     D --> P{held for this<br/>transformation?}
     P -- no --> C[choose an RSE: already holds the block,<br/>else first under the thresholds]
-    C --> K[clone dataset__dx-transformation<br/>+ rule on the clone]
+    C --> K[clone dataset__dx-transformation<br/>+ rule on the clone<br/>attached to container__dx-transformation]
     K --> A
     P -- yes --> A[attach the file to the clone]
-    A --> Q{replica at the RSE?}
-    Q -- yes --> W[wrapped packer, with the RSE's site<br/>as the file's only location]
+    A --> Q{clone AVAILABLE at the RSE?<br/>list_dataset_replicas}
+    Q -- yes --> W[wrapped packer, with the RSE's site<br/>as the files' only location]
     Q -- no --> S{rule STUCK or<br/>older than max_wait_hours?}
     S -- no --> DL[DelayInput poll_minutes]
     S -- yes --> RR{reroutes left?}
@@ -241,8 +241,11 @@ flowchart TD
 - The rule is on a **clone** named after the transformation, holding only the files the
     transformation is fed. Two workgraphs, even of the same Rucio account, never share a rule; a
     retried task finds the clone by its name and the rule by its DID, RSE and comment.
-- Readiness is **per file**: a file at the destination is packed while the rest of its block is still
-    on its way, but a partial group for that site is held back until the transfers to it end.
+- The workflow input is the **container** (the CMS dataset the feeder reads); the dataset clones are
+    attached to the transformation's clone of it, `<container>__dx-<transformation>`, which carries no
+    rule.
+- Readiness is **per dataset**: one `list_dataset_replicas` call per clone, and its inputs are packed
+    only once it is `AVAILABLE` at the destination.
 - The `RucioRuleKeeper` **`Active` hook** renews a rule's lifetime while a file of its clone is still
     needed by an unfinished input. `ReleaseRucioInputRules` shortens them at `Finalizing`, and
     `RemoveRucioRules` deletes every rule of the transformation at `Cleaning`.

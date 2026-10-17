@@ -8,8 +8,10 @@
 #   - puts one rule per input dataset (CMS block), on a clone of the dataset
 #     named after the transformation, at the first destination that already
 #     holds the block, or else the first one under the per-RSE thresholds;
-#   - passes a file on only once it is at the destination, so a parcel runs
-#     where its data is; delays it otherwise;
+#     The clones are attached to a clone of the input container (the workflow
+#     input), which carries no rule;
+#   - passes a dataset's files on only once its clone is complete at the
+#     destination, so a parcel runs where its data is; delays them otherwise;
 #   - re-routes a STUCK or too slow rule to the next destination.
 # The RucioRuleKeeper Active hook renews the rules while inputs need them;
 # ReleaseRucioInputRules lets them expire at Finalizing.
@@ -20,7 +22,7 @@ label: CMS analysis with Rucio input rules
 doc: |-
   Run cmsRun over a DBS dataset, filtered by a lumi mask, in jobs of a fixed
   number of lumis; every input block is held by a Rucio rule at the site its
-  jobs run at, and a job is only created once its files are there.
+  jobs run at, and a job is only created once its block is there.
 
 $namespaces:
   dirac: https://diracgrid.org/cwl#

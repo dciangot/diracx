@@ -51,6 +51,10 @@ class RucioClient(Protocol):
         """The datasets and containers a DID is attached to."""
         ...
 
+    def list_dataset_replicas(self, scope: str, name: str) -> Iterable[dict[str, Any]]:
+        """Per RSE, how much of a dataset is there; ``state`` is ``AVAILABLE`` if all."""
+        ...
+
     def list_files(self, scope: str, name: str) -> Iterable[dict[str, Any]]:
         """The files of a dataset or container, with ``bytes``."""
         ...
@@ -134,6 +138,7 @@ class InputDatasetRow:
     transformation_id: int
     scope: str
     dataset: str
+    container: str  # the input container (the workflow input) it belongs to
     clone_scope: str
     clone: str
     rse: str

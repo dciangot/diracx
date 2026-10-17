@@ -37,7 +37,8 @@ from rucio_inputs import (
 
 HERE = Path(__file__).parent
 STORE = "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/"
-BLOCK = "/Muon/Run2024A-PromptReco-v1/MINIAOD#block"
+CONTAINER = "/Muon/Run2024A-PromptReco-v1/MINIAOD"
+BLOCK = CONTAINER + "#block"
 T = Transformation(7, "wg-analysis", "wg")
 
 
@@ -58,6 +59,8 @@ class World:
         data = json.loads((HERE / "example_rucio.json").read_text())
         data["rses"].update(rses)
         data["replicas"][STORE + "orphan.root"] = {"bytes": 1, "rses": ["T2_DE_DESY"]}
+        data["replicas"][STORE + "loose.root"] = {"bytes": 1, "rses": ["T2_DE_DESY"]}
+        data["datasets"]["cms"]["/Loose#block"] = [STORE + "loose.root"]
         path = tmp_path / "rucio.json"
         path.write_text(json.dumps(data))
         self.clock = SimClock()
@@ -115,13 +118,17 @@ def test_block_in_place_is_pinned_on_a_clone_and_packed_at_once(tmp_path):
     assert rule["comment"] == "DiracX transformation 7"
     # the clone holds the files the transformation was fed, nothing more
     assert world.rucio.collections[clone]["children"] == [STORE + "f1.root"]
+    # and is attached to the transformation's clone of the input container
+    container = world.rucio.collections[CONTAINER + "__dx-wg-analysis"]
+    assert (container["type"], container["children"]) == ("CONTAINER", [clone])
     row = world.dataset("A")
     assert (row.rse, row.files, row.bytes) == ("T2_IT_Legnaro", 2, 1_800_000)
     [ruled] = world.tables.rules(T.id)
     assert (ruled.kind, ruled.name) == ("InputDataset", clone)
+    assert row.container == CONTAINER
 
 
-def test_files_are_monitored_one_by_one(tmp_path):
+def test_datasets_are_monitored_as_a_whole(tmp_path):
     world = World(tmp_path)
     f3 = inp("f3.root", {"3": [[1, 3]]})  # tape only: recall + transfer
     f4 = inp("f4.root", {"4": [[1, 1]]}, n=1)  # at DESY: transfer only
@@ -131,8 +138,8 @@ def test_files_are_monitored_one_by_one(tmp_path):
     assert delay.delay_until == world.clock.now() + timedelta(minutes=15)
     world.clock.advance(timedelta(minutes=11))
     out = world.pack([f3, f4], destinations=["T1_IT_CNAF_Disk"])
-    # f4 is there but held back, since f3 is still on its way to the same site
-    assert out == [DelayInput([f3.id], out[0].delay_until)]
+    # f4 is there, but its dataset is not complete until f3 arrives too
+    assert out == [DelayInput([f3.id, f4.id], out[0].delay_until)]
     world.clock.advance(timedelta(minutes=120))
     parcels = world.pack([f3, f4], destinations=["T1_IT_CNAF_Disk"])
     assert all(isinstance(p, ComputeParcel) for p in parcels)
@@ -219,6 +226,9 @@ def test_file_in_no_dataset_is_bad(tmp_path):
     (bad,) = world.pack([inp("orphan.root", {"1": [[1, 1]]})])
     assert isinstance(bad, BadInput)
     assert "no Rucio dataset" in bad.reason
+    (bad,) = world.pack([inp("loose.root", {"1": [[1, 1]]})])
+    assert isinstance(bad, BadInput)
+    assert "no Rucio container" in bad.reason
 
 
 def test_hint_is_checked():

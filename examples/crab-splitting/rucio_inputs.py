@@ -4,12 +4,14 @@ Any workgraph input that carries a ``dirac:Feeder`` can also carry a
 ``dirac:RucioInputRule``. The core then wraps the step's packer in
 :func:`rucio_input_rules_packer`, with the hint as its arguments, so the
 community's ordinary packer (``CRABSplitter`` for CMS analysis, or any other)
-only ever sees inputs whose file is at the site the parcel will run at.
+only ever sees inputs whose dataset is at the site the parcel will run at.
 
-For each claimed input:
+The workflow input is a container (a CMS dataset, as the feeder reads it);
+its Rucio datasets (CMS blocks) are what rules are put on. For each claimed
+input:
 
-1. **Dataset.** Find the Rucio dataset the file belongs to
-   (``list_parent_dids``; a CMS block).
+1. **Dataset and container.** Find the Rucio dataset the file belongs to,
+   and the container that dataset belongs to (``list_parent_dids``).
 2. **Choose, once per dataset.** Pick a destination RSE among the hint's
    ``destinations``: the first one that already holds every file of the
    dataset (the rule is then a pin), otherwise the first one under the
@@ -20,12 +22,16 @@ For each claimed input:
    (even of the same Rucio account) never share a rule. The file is attached
    to the clone when it is first claimed, and a rule on an open dataset
    covers the files attached after it was made, so the clone holds what the
-   transformation is fed and nothing more. Retried tasks find the clone by
-   its name and the rule by its DID, RSE and comment.
-4. **Monitor, file by file.** A file with a replica at the destination is
-   passed on to the wrapped packer with that RSE's site as its only
+   transformation is fed and nothing more. The clone is attached to the
+   transformation's clone of the input container,
+   ``<container>__dx-<transformation>`` (which carries no rule), so the
+   workflow input is one Rucio DID for the transformation too. Retried tasks
+   find the clones by their names and the rule by its DID, RSE and comment.
+4. **Monitor, dataset by dataset.** One ``list_dataset_replicas`` call per
+   clone: once it is ``AVAILABLE`` (complete) at the destination, its inputs
+   are passed on to the wrapped packer with that RSE's site as their only
    location; the parcel's ``requirements.sites`` is therefore where the data
-   is. Any other file is delayed (``DelayInput``) for ``poll_minutes``.
+   is. Otherwise they are delayed (``DelayInput``) for ``poll_minutes``.
 5. **Re-route.** A ``STUCK`` rule, or one still not done after
    ``max_wait_hours``, is released and the dataset moves to the next
    candidate (a new rule on the same clone), up to ``max_reroutes``; then the
@@ -93,8 +99,9 @@ class RucioInputRule(BaseModel):
         return self
 
 
-def clone_name(dataset: str, transformation: Transformation) -> str:
-    return f"{dataset}{CLONE_MARK}{transformation.name}"
+def clone_name(name: str, transformation: Transformation) -> str:
+    """The transformation's clone of an input dataset or container."""
+    return f"{name}{CLONE_MARK}{transformation.name}"
 
 
 # ---------------------------------------------------------------------------
@@ -152,26 +159,51 @@ class _Planner:
         self.t = transformation
         self.now = now
         self.clone_scope = hint.clone_scope or hint.scope
-        self._parents: dict[str, str | None] = {}
+        self._parents: dict[tuple[str, str], str | None] = {}
         self._content: dict[str, set[str]] = {}
         self._states: dict[str, str] = {}
 
     def did(self, name: str) -> dict[str, str]:
         return {"scope": self.hint.scope, "name": name}
 
-    def dataset_of(self, lfn: str) -> str | None:
-        if lfn not in self._parents:
-            self._parents[lfn] = next(
+    def _parent(self, name: str, kind: str) -> str | None:
+        if (name, kind) not in self._parents:
+            self._parents[(name, kind)] = next(
                 (
                     str(p["name"])
-                    for p in self.rucio.list_parent_dids(self.hint.scope, lfn)
-                    if p.get("type") == "DATASET"
+                    for p in self.rucio.list_parent_dids(self.hint.scope, name)
+                    if p.get("type") == kind
                     and p.get("scope") == self.hint.scope
                     and CLONE_MARK not in str(p["name"])
                 ),
                 None,
             )
-        return self._parents[lfn]
+        return self._parents[(name, kind)]
+
+    def dataset_of(self, lfn: str) -> str | None:
+        return self._parent(lfn, "DATASET")
+
+    def container_of(self, dataset: str) -> str | None:
+        return self._parent(dataset, "CONTAINER")
+
+    def _ensure(self, name: str, kind: str) -> bool:
+        """Create a collection in ``clone_scope`` unless it exists; True if created."""
+        try:
+            self.rucio.get_did(self.clone_scope, name)
+            return False
+        except Exception:  # noqa: BLE001 (DataIdentifierNotFound)
+            if kind == "CONTAINER":
+                self.rucio.add_container(self.clone_scope, name)
+            else:
+                self.rucio.add_dataset(self.clone_scope, name)
+            return True
+
+    def complete_at(self, row: InputDatasetRow) -> bool:
+        """Whether the clone is complete at its destination (one call per dataset)."""
+        return any(
+            r.get("rse") == row.rse and r.get("state") == "AVAILABLE"
+            for r in self.rucio.list_dataset_replicas(row.clone_scope, row.clone)
+        )
 
     def _used(self, rse: str) -> tuple[int, int]:
         rows = [d for d in self.tables.datasets(self.t.id) if d.rse == rse]
@@ -212,7 +244,7 @@ class _Planner:
             now=self.now,
         )
 
-    def placement(self, dataset: str) -> InputDatasetRow | None:
+    def placement(self, dataset: str, container: str) -> InputDatasetRow | None:
         """Where a dataset is held for the transformation, choosing it if needed."""
         row = self.tables.dataset(self.t.id, self.hint.scope, dataset)
         if row is not None:
@@ -222,14 +254,24 @@ class _Planner:
             return None
         rse, n, size = choice
         clone = clone_name(dataset, self.t)
-        try:
-            self.rucio.get_did(self.clone_scope, clone)
-        except Exception:  # noqa: BLE001 (DataIdentifierNotFound)
-            self.rucio.add_dataset(self.clone_scope, clone)
+        container_clone = clone_name(container, self.t)
+        self._ensure(container_clone, "CONTAINER")
+        self._ensure(clone, "DATASET")
+        attached = {
+            str(c["name"])
+            for c in self.rucio.list_content(self.clone_scope, container_clone)
+        }
+        if clone not in attached:
+            self.rucio.attach_dids(
+                self.clone_scope,
+                container_clone,
+                [{"scope": self.clone_scope, "name": clone}],
+            )
         row = InputDatasetRow(
             transformation_id=self.t.id,
             scope=self.hint.scope,
             dataset=dataset,
+            container=container,
             clone_scope=self.clone_scope,
             clone=clone,
             rse=rse,
@@ -308,12 +350,12 @@ def rucio_input_rules_packer(
     transformation: Transformation,
     inner: InnerPacker,
 ) -> Generator[PackerYield, None, None]:
-    """Pass an input to the wrapped packer only once its file is at the job's site."""
+    """Pass an input to the wrapped packer only once its dataset is at the job's site."""
     now = clock.now()
     plan = _Planner(packer_args, rucio, tables, transformation, now)
     max_wait = timedelta(hours=packer_args.max_wait_hours)
 
-    # 1-3: the dataset of every file, where it is held, and the clone's content
+    # 1-3: the dataset and container of every file, and where it is held
     held: dict[str, list[PackerInput]] = {}
     for inp in inputs:
         if inp.lfn is None:
@@ -323,52 +365,45 @@ def rucio_input_rules_packer(
         if dataset is None:
             yield BadInput(inp.id, reason=f"{inp.lfn} is in no Rucio dataset")
             continue
-        if plan.placement(dataset) is None:
+        container = plan.container_of(dataset)
+        if container is None:
+            yield BadInput(inp.id, reason=f"{dataset} is in no Rucio container")
+            continue
+        if plan.placement(dataset, container) is None:
             yield BadInput(inp.id, reason=f"No destination left for {dataset}")
             continue
         held.setdefault(dataset, []).append(inp)
 
-    # 4-5: file by file, in one replica lookup
-    rows = {
-        ds: plan.tables.dataset(transformation.id, packer_args.scope, ds) for ds in held
-    }
-    lfns = [i.lfn for group in held.values() for i in group if i.lfn]
-    at = {
-        str(r["name"]): set(r.get("rses") or {})
-        for r in rucio.list_replicas([plan.did(lfn) for lfn in lfns])
-    }
+    # 4-5: dataset by dataset
     ready: list[PackerInput] = []
     rses: dict[str, str] = {}
     delayed: list[UUID] = []
     waiting_sites: set[str] = set()
     for dataset, group in held.items():
-        row = rows[dataset]
+        row = tables.dataset(transformation.id, packer_args.scope, dataset)
         assert row is not None
         plan.attach(row, [i.lfn for i in group if i.lfn])
-        missing = [i for i in group if row.rse not in at.get(i.lfn or "", set())]
-        missing_ids = {i.id for i in missing}
-        for inp in group:
-            if inp.id not in missing_ids:
+        if plan.complete_at(row):
+            for inp in group:
                 assert inp.lfn is not None
                 ready.append(inp)
                 rses[inp.lfn] = row.rse
-        if not missing:
             continue
         state = plan.state(row)
-        # OK with a file missing: attached after the rule was evaluated, or read
-        # before the replica was; either way, worth waiting on
+        # OK while incomplete: files attached after the rule was evaluated, or
+        # replicas read before they were; either way, worth waiting on
         if state not in {*WAITING_STATES, "OK"} or now - row.since > max_wait:
             # STUCK (or any state that will not resolve itself), or too slow
             moved = plan.reroute(row)
             if moved is None:
-                for inp in missing:
+                for inp in group:
                     yield BadInput(
                         inp.id,
                         reason=f"Rucio rule {row.rule_id} at {row.rse} is {state}",
                     )
                 continue
             row = moved
-        delayed.extend(i.id for i in missing)
+        delayed.extend(i.id for i in group)
         waiting_sites.add(site_of(row.rse))
 
     if delayed:

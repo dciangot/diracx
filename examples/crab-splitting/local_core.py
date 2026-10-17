@@ -182,7 +182,8 @@ class MockRucio:
     """Enough of ``rucio.client.Client`` to watch rules progress in simulated time.
 
     The JSON file holds ``{"rses": {rse: {...}}, "replicas": {lfn: {...}},
-    "datasets": {scope: {dataset: [lfn, ...]}}}``.
+    "datasets": {scope: {dataset: [lfn, ...]}},
+    "containers": {scope: {container: [dataset, ...]}}}``.
     A rule covers a file, or every file of a dataset or container (including
     files attached after the rule was made). A file already at the rule's RSE
     is satisfied at once; otherwise it arrives after the destination's
@@ -206,6 +207,13 @@ class MockRucio:
                     "scope": scope,
                     "type": "DATASET",
                     "children": list(lfns),
+                }
+        for scope, containers in data.get("containers", {}).items():
+            for name, datasets in containers.items():
+                self.collections[name] = {
+                    "scope": scope,
+                    "type": "CONTAINER",
+                    "children": list(datasets),
                 }
 
     def _files(self, name: str) -> list[str]:
@@ -262,6 +270,28 @@ class MockRucio:
             }
             for did in dids
             if did["name"] in self.replicas
+        ]
+
+    def list_dataset_replicas(self, scope: str, name: str) -> list[dict[str, Any]]:
+        for rule in self.rules.values():
+            self._refresh(rule)
+        files = self._files(name)
+        at: dict[str, list[str]] = {}
+        for f in files:
+            for rse in self.replicas[f]["rses"]:
+                at.setdefault(rse, []).append(f)
+        return [
+            {
+                "scope": scope,
+                "name": name,
+                "rse": rse,
+                "length": len(files),
+                "available_length": len(present),
+                "bytes": sum(self.replicas[f]["bytes"] for f in files),
+                "available_bytes": sum(self.replicas[f]["bytes"] for f in present),
+                "state": "AVAILABLE" if len(present) == len(files) else "UNAVAILABLE",
+            }
+            for rse, present in at.items()
         ]
 
     def list_parent_dids(self, scope: str, name: str) -> list[dict[str, Any]]:

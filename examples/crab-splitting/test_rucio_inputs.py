@@ -37,7 +37,8 @@ from rucio_inputs import (
 
 HERE = Path(__file__).parent
 STORE = "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/"
-BLOCK = "/Muon/Run2024A-PromptReco-v1/MINIAOD#block"
+CONTAINER = "/Muon/Run2024A-PromptReco-v1/MINIAOD"
+BLOCK = CONTAINER + "#block"
 T = Transformation(7, "wg-analysis", "wg")
 
 
@@ -58,6 +59,8 @@ class World:
         data = json.loads((HERE / "example_rucio.json").read_text())
         data["rses"].update(rses)
         data["replicas"][STORE + "orphan.root"] = {"bytes": 1, "rses": ["T2_DE_DESY"]}
+        data["replicas"][STORE + "loose.root"] = {"bytes": 1, "rses": ["T2_DE_DESY"]}
+        data["datasets"]["cms"]["/Loose#block"] = [STORE + "loose.root"]
         path = tmp_path / "rucio.json"
         path.write_text(json.dumps(data))
         self.clock = SimClock()
@@ -102,26 +105,32 @@ def test_site_of():
     assert site_of("T2_IT_Pisa") == "T2_IT_Pisa"
 
 
-def test_block_in_place_is_pinned_on_a_clone_and_packed_at_once(tmp_path):
+def clone(rse: str, t: Transformation = T) -> str:
+    return f"{CONTAINER}__dx-{t.name}__{rse}"
+
+
+def test_block_in_place_is_pinned_on_a_cloned_container_and_packed_at_once(tmp_path):
     world = World(tmp_path)
     out = world.pack([inp("f1.root", {"1": [[1, 3]]})])
     assert [type(o) for o in out] == [ComputeParcel]
     assert out[0].requirements == {"sites": ["T2_IT_Legnaro"]}
     assert out[0].metadata["input_rses"] == {STORE + "f1.root": "T2_IT_Legnaro"}
     (rule,) = world.rucio.rules.values()
-    clone = BLOCK + "A__dx-wg-analysis"
-    assert (rule["scope"], rule["name"]) == ("user.test", clone)
+    legnaro = clone("T2_IT_Legnaro")
+    assert (rule["scope"], rule["name"]) == ("user.test", legnaro)
     assert (rule["rse_expression"], rule["state"]) == ("T2_IT_Legnaro", "OK")
     assert rule["comment"] == "DiracX transformation 7"
-    # the clone holds the files the transformation was fed, nothing more
-    assert world.rucio.collections[clone]["children"] == [STORE + "f1.root"]
+    # the cloned container holds the original dataset the transformation reads
+    assert world.rucio.collections[legnaro]["type"] == "CONTAINER"
+    assert world.rucio.collections[legnaro]["children"] == [BLOCK + "A"]
     row = world.dataset("A")
     assert (row.rse, row.files, row.bytes) == ("T2_IT_Legnaro", 2, 1_800_000)
     [ruled] = world.tables.rules(T.id)
-    assert (ruled.kind, ruled.name) == ("InputDataset", clone)
+    assert (ruled.kind, ruled.name) == ("Input", legnaro)
+    assert (row.container, row.clone) == (CONTAINER, legnaro)
 
 
-def test_files_are_monitored_one_by_one(tmp_path):
+def test_datasets_are_monitored_as_a_whole(tmp_path):
     world = World(tmp_path)
     f3 = inp("f3.root", {"3": [[1, 3]]})  # tape only: recall + transfer
     f4 = inp("f4.root", {"4": [[1, 1]]}, n=1)  # at DESY: transfer only
@@ -131,14 +140,14 @@ def test_files_are_monitored_one_by_one(tmp_path):
     assert delay.delay_until == world.clock.now() + timedelta(minutes=15)
     world.clock.advance(timedelta(minutes=11))
     out = world.pack([f3, f4], destinations=["T1_IT_CNAF_Disk"])
-    # f4 is there but held back, since f3 is still on its way to the same site
-    assert out == [DelayInput([f3.id], out[0].delay_until)]
+    # f4 is there, but its dataset is not complete until f3 arrives too
+    assert out == [DelayInput([f3.id, f4.id], out[0].delay_until)]
     world.clock.advance(timedelta(minutes=120))
     parcels = world.pack([f3, f4], destinations=["T1_IT_CNAF_Disk"])
     assert all(isinstance(p, ComputeParcel) for p in parcels)
     assert {i for p in parcels for i in p.inputs} == {f3.id, f4.id}
     assert all(p.requirements == {"sites": ["T1_IT_CNAF"]} for p in parcels)
-    assert len(world.rucio.rules) == 1  # one rule for the block, all along
+    assert len(world.rucio.rules) == 1  # one rule for the clone, all along
 
 
 def test_thresholds_move_a_block_to_the_next_destination(tmp_path):
@@ -169,11 +178,12 @@ def test_stuck_rule_is_rerouted_then_given_up(tmp_path):
         ("T2_IT_Pisa", "T2_IT_Legnaro"),
     )
     old, new = sorted(world.tables.rules(T.id), key=lambda r: r.created_at)
-    assert old.rse_expression == "T2_IT_Pisa" and old.released_at is not None
-    assert new.rse_expression == "T2_IT_Legnaro" and new.released_at is None
-    assert old.name == new.name  # a second rule on the same clone
-    expires = world.rucio.get_replication_rule(old.rule_id)["expires_at"]
-    assert expires == world.clock.now() + timedelta(hours=24)
+    assert (old.rse_expression, old.name) == ("T2_IT_Pisa", clone("T2_IT_Pisa"))
+    assert (new.rse_expression, new.name) == ("T2_IT_Legnaro", clone("T2_IT_Legnaro"))
+    # the dataset moved from one cloned container to the other
+    assert world.rucio.collections[old.name]["children"] == []
+    assert world.rucio.collections[new.name]["children"] == [BLOCK + "B"]
+    assert row.clone == new.name
 
     world2 = World(tmp_path)
     world2.pack([f3], destinations=["T2_IT_Pisa"])
@@ -211,7 +221,7 @@ def test_two_transformations_never_share_a_rule(tmp_path):
     world.pack([inp("f1.root", {"1": [[1, 3]]})])
     world.pack([inp("f1.root", {"1": [[1, 3]]})], transformation=other)
     names = sorted(r["name"] for r in world.rucio.rules.values())
-    assert names == [BLOCK + "A__dx-wg-analysis", BLOCK + "A__dx-wg2-analysis"]
+    assert names == [clone("T2_IT_Legnaro"), clone("T2_IT_Legnaro", other)]
 
 
 def test_file_in_no_dataset_is_bad(tmp_path):
@@ -219,6 +229,9 @@ def test_file_in_no_dataset_is_bad(tmp_path):
     (bad,) = world.pack([inp("orphan.root", {"1": [[1, 1]]})])
     assert isinstance(bad, BadInput)
     assert "no Rucio dataset" in bad.reason
+    (bad,) = world.pack([inp("loose.root", {"1": [[1, 1]]})])
+    assert isinstance(bad, BadInput)
+    assert "no Rucio container" in bad.reason
 
 
 def test_hint_is_checked():
@@ -228,9 +241,20 @@ def test_hint_is_checked():
         RucioInputRule(destinations=["T2_IT_Pisa", "T2_IT_Pisa"])
 
 
-def test_release_shortens_lifetimes(tmp_path):
+def test_datasets_of_a_container_share_the_clone_for_their_rse(tmp_path):
     world = World(tmp_path)
     world.pack([inp("f1.root", {"1": [[1, 3]]}), inp("f4.root", {"4": [[1, 1]]}, 1)])
+    (rule,) = world.rucio.rules.values()
+    assert world.rucio.collections[rule["name"]]["children"] == [
+        BLOCK + "A",
+        BLOCK + "B",
+    ]
+
+
+def test_release_shortens_lifetimes(tmp_path):
+    world = World(tmp_path)
+    world.pack([inp("f1.root", {"1": [[1, 3]]})])
+    world.pack([inp("f4.root", {"4": [[1, 1]]}, 1)], destinations=["T1_IT_CNAF_Disk"])
     result = release_rucio_input_rules(
         args=ReleaseRucioInputRulesArgs(grace_hours=1),
         rucio=world.rucio,
@@ -255,7 +279,8 @@ class Live:
 
 def test_keeper_renews_only_rules_still_needed(tmp_path):
     world = World(tmp_path)
-    world.pack([inp("f1.root", {"1": [[1, 3]]}), inp("f4.root", {"4": [[1, 1]]}, 1)])
+    world.pack([inp("f1.root", {"1": [[1, 3]]})])
+    world.pack([inp("f4.root", {"4": [[1, 1]]}, 1)], destinations=["T1_IT_CNAF_Disk"])
     world.clock.advance(timedelta(days=12))  # two days left on 14-day rules
     live = Live([LiveInput(STORE + "f1.root", "Assigned", ("T2_IT_Legnaro",))])
     rucio_rule_keeper_hook(
@@ -312,7 +337,7 @@ def test_end_to_end_waits_reroutes_and_renews(tmp_path, capsys):
     assert result["summary"]["total_lumis"] == 12
     assert result["input_datasets"][BLOCK + "A"]["rse"] == "T2_IT_Legnaro"
     assert result["input_datasets"][BLOCK + "B"] == {
-        "clone": BLOCK + "B__dx-rucio_input_rules-analysis",
+        "clone": f"{CONTAINER}__dx-rucio_input_rules-analysis__T1_IT_CNAF_Disk",
         "rse": "T1_IT_CNAF_Disk",
         "reroutes": 1,
     }
@@ -320,6 +345,6 @@ def test_end_to_end_waits_reroutes_and_renews(tmp_path, capsys):
     assert sorted(kinds) == [
         ("T1_IT_CNAF_Disk", False),
         ("T2_IT_Legnaro", False),
-        ("T2_IT_Pisa", True),
+        ("T2_IT_Pisa", False),
     ]
     assert result["cycles"] > 1

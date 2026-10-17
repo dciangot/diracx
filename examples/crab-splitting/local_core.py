@@ -182,10 +182,9 @@ class MockRucio:
     """Enough of ``rucio.client.Client`` to watch rules progress in simulated time.
 
     The JSON file holds ``{"rses": {rse: {...}}, "replicas": {lfn: {...}},
-    "datasets": {scope: {dataset: [lfn, ...]}},
-    "containers": {scope: {container: [dataset, ...]}}}``.
+    "datasets": {scope: {dataset: [lfn, ...]}}}``.
     A rule covers a file, or every file of a dataset or container (including
-    what is attached after the rule was made, and no longer what is detached). A file already at the rule's RSE
+    files attached after the rule was made). A file already at the rule's RSE
     is satisfied at once; otherwise it arrives after the destination's
     ``transfer_minutes``, plus the source's ``recall_minutes`` when every
     source is a tape, and the replica then appears at the destination. The
@@ -207,13 +206,6 @@ class MockRucio:
                     "scope": scope,
                     "type": "DATASET",
                     "children": list(lfns),
-                }
-        for scope, containers in data.get("containers", {}).items():
-            for name, datasets in containers.items():
-                self.collections[name] = {
-                    "scope": scope,
-                    "type": "CONTAINER",
-                    "children": list(datasets),
                 }
 
     def _files(self, name: str) -> list[str]:
@@ -239,10 +231,7 @@ class MockRucio:
         rse = rule["rse_expression"]
         stuck = bool(self.rses[rse].get("stuck"))
         arrivals = rule["arrivals"]
-        covered = self._files(rule["name"])
-        for name in set(arrivals) - set(covered):
-            del arrivals[name]  # detached
-        for name in covered:
+        for name in self._files(rule["name"]):
             if name not in arrivals:
                 delay = self._delay(name, rse)
                 arrivals[name] = (now + timedelta(minutes=delay), delay > 0)
@@ -273,28 +262,6 @@ class MockRucio:
             }
             for did in dids
             if did["name"] in self.replicas
-        ]
-
-    def list_dataset_replicas(self, scope: str, name: str) -> list[dict[str, Any]]:
-        for rule in self.rules.values():
-            self._refresh(rule)
-        files = self._files(name)
-        at: dict[str, list[str]] = {}
-        for f in files:
-            for rse in self.replicas[f]["rses"]:
-                at.setdefault(rse, []).append(f)
-        return [
-            {
-                "scope": scope,
-                "name": name,
-                "rse": rse,
-                "length": len(files),
-                "available_length": len(present),
-                "bytes": sum(self.replicas[f]["bytes"] for f in files),
-                "available_bytes": sum(self.replicas[f]["bytes"] for f in present),
-                "state": "AVAILABLE" if len(present) == len(files) else "UNAVAILABLE",
-            }
-            for rse, present in at.items()
         ]
 
     def list_parent_dids(self, scope: str, name: str) -> list[dict[str, Any]]:
@@ -408,16 +375,6 @@ class MockRucio:
                 children.append(did["name"])
         for rule in self.rules.values():
             self._refresh(rule)  # rules on open collections cover new files
-        return True
-
-    def detach_dids(self, scope: str, name: str, dids: list[dict[str, str]]) -> bool:
-        children = self.collections[name]["children"]
-        for did in dids:
-            if did["name"] not in children:
-                raise KeyError(f"DataIdentifierNotFound: {did['name']} in {name}")
-            children.remove(did["name"])
-        for rule in self.rules.values():
-            self._refresh(rule)
         return True
 
     def list_content(self, scope: str, name: str) -> list[dict[str, str]]:

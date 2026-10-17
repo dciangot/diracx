@@ -25,7 +25,7 @@ from adr006 import Status, Transformation
 #: Rule states (``rucio.db.sqla.constants.RuleState``) that are worth waiting on.
 WAITING_STATES = {"REPLICATING", "SUSPENDED", "WAITING_APPROVAL", "INJECT"}
 
-RuleKind = Literal["Input", "Output"]
+RuleKind = Literal["InputDataset", "Output"]
 
 
 def site_of(rse: str) -> str:
@@ -49,10 +49,6 @@ class RucioClient(Protocol):
 
     def list_parent_dids(self, scope: str, name: str) -> Iterable[dict[str, Any]]:
         """The datasets and containers a DID is attached to."""
-        ...
-
-    def list_dataset_replicas(self, scope: str, name: str) -> Iterable[dict[str, Any]]:
-        """Per RSE, how much of a dataset is there; ``state`` is ``AVAILABLE`` if all."""
         ...
 
     def list_files(self, scope: str, name: str) -> Iterable[dict[str, Any]]:
@@ -111,10 +107,6 @@ class RucioClient(Protocol):
         """Attach files to a dataset, or datasets to a container."""
         ...
 
-    def detach_dids(self, scope: str, name: str, dids: list[dict[str, str]]) -> bool:
-        """Detach DIDs from a dataset or container; its rules stop covering them."""
-        ...
-
 
 # ---------------------------------------------------------------------------
 # Extension-owned tables
@@ -142,9 +134,8 @@ class InputDatasetRow:
     transformation_id: int
     scope: str
     dataset: str
-    container: str  # the input container the dataset belongs to
     clone_scope: str
-    clone: str  # the cloned container the dataset is attached to
+    clone: str
     rse: str
     rule_id: str
     files: int

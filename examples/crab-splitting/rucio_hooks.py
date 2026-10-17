@@ -6,10 +6,10 @@ rules in step with its inputs, and proposes no operation:
 
 - **Renew input rules.** A rule whose lifetime ends within
   ``renew_before_hours`` is extended to ``extend_days`` from now if at least
-  one file of the datasets attached to its cloned container is still needed
-  by an unfinished input: an ``Unassigned`` or ``Failed`` one, or an
-  ``Assigned`` one whose parcel runs at the rule's site. Other rules (e.g. a
-  clone left empty by a re-route) are left to expire.
+  one file of its clone is still needed by an unfinished input: an
+  ``Unassigned`` or ``Failed`` one for the dataset's current rule, an
+  ``Assigned`` one whose parcel runs at the rule's site for any rule
+  (including one released by a re-route). Other rules are left to expire.
 - **Create output rules at a threshold.** A container whose
   ``dirac:RucioRule`` sets ``min_completion`` gets its rule once the
   transformation's feeder is exhausted (every input is known) and that
@@ -57,14 +57,24 @@ def rucio_rule_keeper_hook(
     """Renew the input rules still needed; create the output rules now due."""
     now = clock.now()
     inputs = live.live()
+    current = {d.rule_id: d for d in tables.datasets(transformation.id)}
+    clones = {(d.clone_scope, d.clone) for d in current.values()}
+    content = {
+        clone: {str(c["name"]) for c in rucio.list_content(scope, clone)}
+        for scope, clone in clones
+    }
     renew_before = timedelta(hours=args.renew_before_hours)
     for rule in tables.rules(transformation.id):
-        if rule.kind != "Input" or rule.released_at is not None:
+        if rule.kind != "InputDataset" or (rule.scope, rule.name) not in clones:
             continue
-        files = {str(f["name"]) for f in rucio.list_files(rule.scope, rule.name)}
+        files = content[rule.name]
         site = site_of(rule.rse_expression)
         needed = any(
-            i.lfn in files and (i.status != "Assigned" or site in i.sites)
+            i.lfn in files
+            and (
+                (i.status == "Assigned" and site in i.sites)
+                or (i.status != "Assigned" and rule.rule_id in current)
+            )
             for i in inputs
         )
         expires = _expires(rucio.get_replication_rule(rule.rule_id))

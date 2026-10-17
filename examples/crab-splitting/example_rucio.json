@@ -27,13 +27,5 @@
         "/store/data/Run2024A/Muon/MINIAOD/PromptReco-v1/000/f4.root"
       ]
     }
-  },
-  "containers": {
-    "cms": {
-      "/Muon/Run2024A-PromptReco-v1/MINIAOD": [
-        "/Muon/Run2024A-PromptReco-v1/MINIAOD#blockA",
-        "/Muon/Run2024A-PromptReco-v1/MINIAOD#blockB"
-      ]
-    }
   }
 }

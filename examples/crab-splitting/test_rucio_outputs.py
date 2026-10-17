@@ -376,7 +376,7 @@ def test_end_to_end_merge_and_transfer(tmp_path, capsys):
     assert output["name"] == "/Muon/cmsuser-Run2024A-rucio_merge_transfer/USER"
     assert (output["rse_expression"], output["state"]) == ("T2_DE_DESY", "OK")
     # no rule on intermediates; every input rule released at Finalizing
-    inputs = [r for r in rules if r["kind"] == "Input"]
+    inputs = [r for r in rules if r["kind"] == "InputDataset"]
     assert len(inputs) == len(rules) - 1 == 3
     assert all(r["released"] for r in inputs)
 

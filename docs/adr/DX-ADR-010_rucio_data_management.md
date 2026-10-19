@@ -19,7 +19,7 @@ A workgraph running in a Rucio installation can ask for two things:
 
 Rucio stays what DX-ADR-008 says it is: a system of standing declarations, not a data backend. No parcel is ever made of a rule. DiracX creates rules, records them in an extension table, polls their state from packers and actions, renews their lifetime from a hook while inputs still need them, and shortens it when it is done with them. Everything specific to Rucio lives in extension plugins and in the installation's catalogue implementation; the core gains a registration interface, the wrapping of a packer by an input hint, and a read-only view of live inputs (see Open Issues).
 
-## Motivation
+# Motivation
 
 DX-ADR-008 makes data management transformations RMS-driven and leaves Rucio to the communities: "declaring in the workgraph document that an output should carry a Rucio rule [...] is wanted by installations that use Rucio. Who creates the rule, who owns its lifetime, and what a workgraph's cleaning does to it are open." CMS needs an answer before it can run non-MC workflows on DiracX. CMS already uses Rucio on both sides of a job:
 
@@ -282,3 +282,4 @@ Rule bytes stay outside the DX-ADR-009 counters, as DX-ADR-008 states. `RucioInp
 - **Upload location.** `ProducedFile.location` must come from the job wrapper's report of where each file was uploaded (DX-ADR-007 abandoned uploads), not from the parcel's requirements.
 - **Stuck output transfers.** `WaitForRucioTransfers` blocks the transformation on a `STUCK` rule. Whether it should first try another RSE expression, and who decides, is open.
 - **Schema.** `dirac:RucioRule` must be added to the published `dirac:` JSON schema (DX-ADR-007), with its defaults resolved through the configuration service like other hint fields. Same for a RUCIO input rule hint if it will be needed.
+- **Delay output rule until workflows % completion.** Not sure where this can be implemented, but having either an outmatic procuder enabling the stageout after a % of the task, or after a human click would be required for certain workflows.

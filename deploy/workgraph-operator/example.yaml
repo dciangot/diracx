@@ -1,0 +1,41 @@
+apiVersion: workgraphs.diracx.io/v1alpha1
+kind: WorkGraph
+metadata:
+  name: simulation-definition
+spec:
+  cwl:
+    cwlVersion: v1.2
+    class: Workflow
+    $namespaces:
+      dirac: https://diracgrid.org/cwl#
+    hints:
+      dirac:Workgraph:
+        schema_version: "1.0"
+        type: MCSimulation
+        target:
+          output: datasets
+          files: 20
+    inputs:
+      events:
+        type:
+          type: array
+          items: [File, string]
+        dirac:Feeder:
+          name: Seeds
+          args:
+            target_events: 20000
+    steps:
+      simulate:
+        hints:
+          dirac:Transformation:
+            packer:
+              name: PerInput
+        # Opaque reference: the definition operator never fetches or executes it.
+        run: transformations/gauss.cwl
+        in:
+          seed: events
+        out: [simulated]
+    outputs:
+      datasets:
+        type: File[]
+        outputSource: simulate/simulated

@@ -505,27 +505,29 @@ def test_expired_pagination_restarts(validator):
     assert operator.continuation is None
 
 
-def test_real_client_serializes_status_merge_patch():
+def test_real_client_serializes_status_merge_patch(validator, resource):
     with client.ApiClient() as api_client:
         api_client._call_with_legacy_options = Mock(return_value={})
-        client.CustomObjectsApi(api_client).patch_namespaced_custom_object_status(
-            GROUP,
-            VERSION,
-            "test",
-            PLURAL,
-            "example",
-            {"metadata": {"resourceVersion": "1"}, "status": {}},
-            _content_type="application/merge-patch+json",
-            _request_timeout=REQUEST_TIMEOUT,
+        WorkGraphOperator(
+            client.CustomObjectsApi(api_client), "test", validator
+        ).reconcile(resource)
+        method, path, headers, body = (
+            api_client._call_with_legacy_options.call_args.args[0][:4]
         )
-        method, path, headers = api_client._call_with_legacy_options.call_args.args[0][
-            :3
-        ]
         assert method == "PATCH"
         assert (
-            path == f"/apis/{GROUP}/{VERSION}/namespaces/test/{PLURAL}/example/status"
+            path == f"/apis/{GROUP}/{VERSION}/namespaces/test/{PLURAL}/"
+            f"{resource['metadata']['name']}/status"
         )
         assert headers["Content-Type"] == "application/merge-patch+json"
+        assert body["metadata"] == {"resourceVersion": "1"}
+        assert set(body) == {"metadata", "status"}
+        assert body["status"]["phase"] == "Defined"
+        assert body["status"]["observedGeneration"] == 1
+        assert body["status"]["conditions"][0]["status"] == "True"
+        assert (
+            api_client._call_with_legacy_options.call_args.args[-2] == REQUEST_TIMEOUT
+        )
 
 
 def test_graph_size_bounded(validator, resource, doc):

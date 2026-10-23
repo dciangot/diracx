@@ -25867,6 +25867,8 @@ packages:
   - pydantic>=2.10
   - python-dateutil
   - redis[hiredis]
+  - jsonschema>=4.26.0,<5 ; extra == 'kubernetes'
+  - kubernetes>=37.0.1,<38 ; extra == 'kubernetes'
   - diracx-testing ; extra == 'testing'
   - fakeredis ; extra == 'testing'
   requires_python: '>=3.11'

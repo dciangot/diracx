@@ -28,9 +28,11 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 testing = ["diracx-testing", "fakeredis"]
+kubernetes = ["kubernetes>=37.0.1,<38", "jsonschema>=4.26.0,<5"]
 
 [project.scripts]
 diracx-tasks = "diracx.tasks.task_run:main"
+diracx-workgraph-operator = "diracx.tasks.workgraphs.operator:main"
 
 [project.entry-points."diracx.dbs.sql"]
 TaskDB = "diracx.tasks.plumbing.persistence:TaskDB"
@@ -52,6 +54,9 @@ root = ".."
 
 [tool.hatch.build.targets.sdist.force-include]
 "../LICENSE" = "LICENSE"
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/diracx"]

@@ -1,0 +1,98 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: workgraphs.workgraphs.diracx.io
+spec:
+  group: workgraphs.diracx.io
+  scope: Namespaced
+  names:
+    plural: workgraphs
+    singular: workgraph
+    kind: WorkGraph
+    shortNames: [wg]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Validated
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Validated")].status
+        - name: Generation
+          type: integer
+          jsonPath: .status.observedGeneration
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [cwl]
+              properties:
+                cwl:
+                  description: CWL v1.2 workgraph document; validated asynchronously.
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                inputs:
+                  description: Optional parameter values, not execution instructions.
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+                  format: int64
+                phase:
+                  type: string
+                  enum: [Defined, Invalid]
+                summary:
+                  type: object
+                  properties:
+                    steps:
+                      type: integer
+                      minimum: 0
+                    dataManagement:
+                      type: integer
+                      minimum: 0
+                    dependencies:
+                      type: integer
+                      minimum: 0
+                conditions:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [type]
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - reason
+                      - message
+                      - observedGeneration
+                      - lastTransitionTime
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", Unknown]
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                      lastTransitionTime:
+                        type: string
+                        format: date-time

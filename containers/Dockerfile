@@ -14,6 +14,7 @@ COPY diracx-core/ diracx-core/
 COPY diracx-db/ diracx-db/
 COPY diracx-logic/ diracx-logic/
 COPY diracx-tasks/ diracx-tasks/
+COPY docs/schemas/dirac-1.0.json docs/schemas/dirac-1.0.json
 COPY diracx-routers/ diracx-routers/
 COPY diracx-testing/ diracx-testing/
 COPY pyproject.toml ./
